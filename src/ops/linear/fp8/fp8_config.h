@@ -156,6 +156,19 @@ enum class Fp8Problem : std::uint8_t {
     Vocabulary,
     Residual6144,
     Residual17408,
+    // TP2 shard, appended so the existing values keep their encodings. Families that switch over
+    // this enum without a `default:` fall through to their own "unsupported problem" throw for it,
+    // which is correct for any family that has no split path at this shape.
+    VocabularyTp2Column,
+    // gdn_input_proj's own tp2 column shard, appended for the same reason.
+    GdnInputTp2Column,
+    // linear_add's own tp2 row shards, appended for the same reason.
+    Residual6144Tp2Row,
+    Residual17408Tp2Row,
+    // linear_swiglu's own tp2 column shard, appended for the same reason.
+    MlpGateUpTp2Column,
+    // attn_input_proj's own tp2 column shard, appended for the same reason.
+    AttnInputTp2Column,
 };
 
 inline constexpr bool is_fp8_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -170,7 +183,19 @@ inline constexpr bool is_fp8_linear_problem(std::int32_t output_rows, std::int32
            (output_rows == Fp8Residual6144Geometry::kOutputRows &&
             input_rows == Fp8Residual6144Geometry::kInputRows) ||
            (output_rows == Fp8Residual17408Geometry::kOutputRows &&
-            input_rows == Fp8Residual17408Geometry::kInputRows);
+            input_rows == Fp8Residual17408Geometry::kInputRows) ||
+           (output_rows == Fp8VocabularyTp2ColumnGeometry::kOutputRows &&
+            input_rows == Fp8VocabularyTp2ColumnGeometry::kInputRows) ||
+           (output_rows == Fp8GdnInputTp2ColumnGeometry::kOutputRows &&
+            input_rows == Fp8GdnInputTp2ColumnGeometry::kInputRows) ||
+           (output_rows == Fp8Residual6144Tp2RowGeometry::kOutputRows &&
+            input_rows == Fp8Residual6144Tp2RowGeometry::kInputRows) ||
+           (output_rows == Fp8Residual17408Tp2RowGeometry::kOutputRows &&
+            input_rows == Fp8Residual17408Tp2RowGeometry::kInputRows) ||
+           (output_rows == Fp8MlpGateUpTp2ColumnGeometry::kOutputRows &&
+            input_rows == Fp8MlpGateUpTp2ColumnGeometry::kInputRows) ||
+           (output_rows == Fp8AttnInputTp2ColumnGeometry::kOutputRows &&
+            input_rows == Fp8AttnInputTp2ColumnGeometry::kInputRows);
 }
 
 inline Fp8Problem resolve_fp8_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -198,7 +223,36 @@ inline Fp8Problem resolve_fp8_problem(std::int32_t output_rows, std::int32_t inp
         input_rows == Fp8Residual17408Geometry::kInputRows) {
         return Fp8Problem::Residual17408;
     }
+    if (output_rows == Fp8VocabularyTp2ColumnGeometry::kOutputRows &&
+        input_rows == Fp8VocabularyTp2ColumnGeometry::kInputRows) {
+        return Fp8Problem::VocabularyTp2Column;
+    }
+    if (output_rows == Fp8GdnInputTp2ColumnGeometry::kOutputRows &&
+        input_rows == Fp8GdnInputTp2ColumnGeometry::kInputRows) {
+        return Fp8Problem::GdnInputTp2Column;
+    }
+    if (output_rows == Fp8Residual6144Tp2RowGeometry::kOutputRows &&
+        input_rows == Fp8Residual6144Tp2RowGeometry::kInputRows) {
+        return Fp8Problem::Residual6144Tp2Row;
+    }
+    if (output_rows == Fp8Residual17408Tp2RowGeometry::kOutputRows &&
+        input_rows == Fp8Residual17408Tp2RowGeometry::kInputRows) {
+        return Fp8Problem::Residual17408Tp2Row;
+    }
+    if (output_rows == Fp8MlpGateUpTp2ColumnGeometry::kOutputRows &&
+        input_rows == Fp8MlpGateUpTp2ColumnGeometry::kInputRows) {
+        return Fp8Problem::MlpGateUpTp2Column;
+    }
+    if (output_rows == Fp8AttnInputTp2ColumnGeometry::kOutputRows &&
+        input_rows == Fp8AttnInputTp2ColumnGeometry::kInputRows) {
+        return Fp8Problem::AttnInputTp2Column;
+    }
     throw std::invalid_argument("unsupported FP8 problem");
+}
+
+// True for the problems whose only route is the vocabulary A16 MMA path, at every policy and T.
+inline constexpr bool is_fp8_vocabulary_problem(Fp8Problem problem) {
+    return problem == Fp8Problem::Vocabulary || problem == Fp8Problem::VocabularyTp2Column;
 }
 
 template <class Geometry>
@@ -216,6 +270,11 @@ struct Fp8LinearDecodeProductionSchedule<Fp8GdnInputGeometry> {
     using Type = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
 };
 
+// The tp2 column shard inherits the parent's measured decode schedule.
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8GdnInputTp2ColumnGeometry>
+    : Fp8LinearDecodeProductionSchedule<Fp8GdnInputGeometry> {};
+
 template <>
 struct Fp8LinearDecodeProductionSchedule<Fp8MlpGateUpGeometry> {
     using Type = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
@@ -231,6 +290,24 @@ struct Fp8LinearDecodeProductionSchedule<Fp8Residual17408Geometry> {
     using Type = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
 };
 
+// Every new tp2 shard inherits its parent's measured decode schedule: tuning is inherited from
+// the tp1 parent family, never re-measured for the shard.
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8Residual6144Tp2RowGeometry>
+    : Fp8LinearDecodeProductionSchedule<Fp8Residual6144Geometry> {};
+
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8Residual17408Tp2RowGeometry>
+    : Fp8LinearDecodeProductionSchedule<Fp8Residual17408Geometry> {};
+
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8MlpGateUpTp2ColumnGeometry>
+    : Fp8LinearDecodeProductionSchedule<Fp8MlpGateUpGeometry> {};
+
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8AttnInputTp2ColumnGeometry>
+    : Fp8LinearDecodeProductionSchedule<Fp8AttnInputGeometry> {};
+
 inline constexpr std::int32_t kFp8FirstSmallT = 2;
 inline constexpr std::int32_t kFp8LastSmallT  = 24;
 
@@ -243,6 +320,12 @@ inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8AttnInputGeometry> = 11;
 template <>
 inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8GdnInputGeometry> = 10;
 
+// The tp2 column shard inherits the parent's measured small-T ceiling -- tuning is inherited from
+// the tp1 parent family, never re-measured for the shard.
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8GdnInputTp2ColumnGeometry> =
+    kFp8LinearSmallTMax<Fp8GdnInputGeometry>;
+
 template <>
 inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8MlpGateUpGeometry> = 4;
 
@@ -252,6 +335,23 @@ inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8Residual6144Geometry> = kFp
 template <>
 inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8Residual17408Geometry> = kFp8LastSmallT;
 
+// Every new tp2 shard inherits its parent's measured small-T ceiling.
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8Residual6144Tp2RowGeometry> =
+    kFp8LinearSmallTMax<Fp8Residual6144Geometry>;
+
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8Residual17408Tp2RowGeometry> =
+    kFp8LinearSmallTMax<Fp8Residual17408Geometry>;
+
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8MlpGateUpTp2ColumnGeometry> =
+    kFp8LinearSmallTMax<Fp8MlpGateUpGeometry>;
+
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8AttnInputTp2ColumnGeometry> =
+    kFp8LinearSmallTMax<Fp8AttnInputGeometry>;
+
 inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
     switch (problem) {
     case Fp8Problem::AttnInput:
@@ -260,12 +360,24 @@ inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
         return kFp8LinearSmallTMax<Fp8GdnInputGeometry>;
     case Fp8Problem::MlpGateUp:
         return kFp8LinearSmallTMax<Fp8MlpGateUpGeometry>;
+    case Fp8Problem::GdnInputTp2Column:
+        return kFp8LinearSmallTMax<Fp8GdnInputTp2ColumnGeometry>;
     case Fp8Problem::Vocabulary:
+    case Fp8Problem::VocabularyTp2Column:
         break;
     case Fp8Problem::Residual6144:
         return kFp8LinearSmallTMax<Fp8Residual6144Geometry>;
     case Fp8Problem::Residual17408:
         return kFp8LinearSmallTMax<Fp8Residual17408Geometry>;
+    case Fp8Problem::Residual6144Tp2Row:
+        return kFp8LinearSmallTMax<Fp8Residual6144Tp2RowGeometry>;
+    case Fp8Problem::Residual17408Tp2Row:
+        return kFp8LinearSmallTMax<Fp8Residual17408Tp2RowGeometry>;
+    case Fp8Problem::MlpGateUpTp2Column:
+    case Fp8Problem::AttnInputTp2Column:
+        // Not routed through ops::linear's own kernel-level dispatch (linear_swiglu / attn_input_proj
+        // own their own registries under src/ops/<family>/fp8) -- unreachable from here.
+        break;
     }
     throw std::logic_error("FP8 vocabulary uses its A16 MMA route");
 }
@@ -308,6 +420,11 @@ struct Fp8LinearSmallTProductionSchedule<Fp8GdnInputGeometry, ActiveTokens> {
                           Fp8CodeCache::Default, 1, Fp8SmallTBlockOrder::RowsContiguous, 1>;
 };
 
+// The tp2 column shard inherits the parent's measured small-T schedule at every T.
+template <int ActiveTokens>
+struct Fp8LinearSmallTProductionSchedule<Fp8GdnInputTp2ColumnGeometry, ActiveTokens>
+    : Fp8LinearSmallTProductionSchedule<Fp8GdnInputGeometry, ActiveTokens> {};
+
 template <int ActiveTokens>
 struct Fp8LinearSmallTProductionSchedule<Fp8MlpGateUpGeometry, ActiveTokens> {
     static_assert(ActiveTokens >= kFp8FirstSmallT);
@@ -346,5 +463,23 @@ struct Fp8LinearSmallTProductionSchedule<Fp8Residual17408Geometry, ActiveTokens>
                                    Fp8SmallTActivationAccess::TokenPacked, Fp8CodeCache::Default, 1,
                                    Fp8SmallTBlockOrder::RowsContiguous, 1>;
 };
+
+// Every new tp2 shard inherits its parent's measured small-T schedule at every T: tuning is
+// inherited from the tp1 parent family, never re-measured for the shard.
+template <int ActiveTokens>
+struct Fp8LinearSmallTProductionSchedule<Fp8Residual6144Tp2RowGeometry, ActiveTokens>
+    : Fp8LinearSmallTProductionSchedule<Fp8Residual6144Geometry, ActiveTokens> {};
+
+template <int ActiveTokens>
+struct Fp8LinearSmallTProductionSchedule<Fp8Residual17408Tp2RowGeometry, ActiveTokens>
+    : Fp8LinearSmallTProductionSchedule<Fp8Residual17408Geometry, ActiveTokens> {};
+
+template <int ActiveTokens>
+struct Fp8LinearSmallTProductionSchedule<Fp8MlpGateUpTp2ColumnGeometry, ActiveTokens>
+    : Fp8LinearSmallTProductionSchedule<Fp8MlpGateUpGeometry, ActiveTokens> {};
+
+template <int ActiveTokens>
+struct Fp8LinearSmallTProductionSchedule<Fp8AttnInputTp2ColumnGeometry, ActiveTokens>
+    : Fp8LinearSmallTProductionSchedule<Fp8AttnInputGeometry, ActiveTokens> {};
 
 } // namespace ninfer::ops::detail

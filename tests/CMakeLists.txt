@@ -58,6 +58,10 @@ ninfer_add_test(ninfer_artifact_reader_test
 ninfer_add_test(ninfer_artifact_materialization_test
   SOURCES test_artifact_materialization.cpp
   LIBRARIES ninfer_artifact)
+# Host-only: no artifact, no device. Byte-level TP2 shard slice geometry per storage layout.
+ninfer_add_test(ninfer_tensor_slice_test
+  SOURCES test_tensor_slice.cpp
+  LIBRARIES ninfer_artifact)
 ninfer_add_test(ninfer_media_decode_test
   SOURCES test_media_decode.cpp
   LIBRARIES ninfer_media_decode)
@@ -76,6 +80,8 @@ ninfer_add_test(ninfer_context_cost_test SOURCES test_context_cost.cpp)
 ninfer_add_test(ninfer_resource_manager_test SOURCES test_resource_manager.cpp)
 ninfer_add_test(ninfer_materialization_budget_test SOURCES test_materialization_budget.cpp)
 ninfer_add_test(ninfer_kv_capacity_test SOURCES test_kv_capacity.cpp)
+# Host-only: no artifact, no device, no Engine construction. tp2 per-device KV pool sizing (4.1).
+ninfer_add_test(ninfer_kv_capacity_tp2_test SOURCES test_kv_capacity_tp2.cpp)
 ninfer_add_test(ninfer_sampling_defaults_test
   SOURCES test_sampling_defaults.cpp
   LIBRARIES ninfer_engine ninfer_core)
@@ -160,6 +166,23 @@ target_include_directories(ninfer_qwen3_6_27b_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 target_link_libraries(ninfer_qwen3_6_27b_load_plan_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen3_6_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_sharded_materialization_test
+  SOURCES targets/qwen3_6_27b/test_sharded_materialization.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_qwen3_6_27b_sharded_materialization_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/impl
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+target_link_libraries(ninfer_qwen3_6_27b_sharded_materialization_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen3_6_27b_sharded_materialization_test PROPERTIES SKIP_RETURN_CODE 77)
+# Host-only: no artifact, no device. Pure TP2 ShardPlan table test.
+ninfer_add_test(ninfer_qwen3_6_27b_shard_map_test
+  SOURCES targets/test_shard_map.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_qwen3_6_27b_shard_map_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/impl
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 ninfer_add_test(ninfer_qwen3_6_35b_a3b_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_real.cpp
   LIBRARIES ninfer_engine)
@@ -198,6 +221,21 @@ ninfer_add_test(ninfer_tool_call_parser_test
 ninfer_add_test(ninfer_serve_options_test
   SOURCES test_serve_options.cpp
   LIBRARIES ninfer_serve)
+# Host-only: no artifact, no device. `--rope native|yarn` parsing on BOTH product front ends plus
+# the effective-context-ceiling resolution and its accept/reject matrix. The CLI parser is
+# compiled in directly because apps/ninfer is an executable, not a library.
+ninfer_add_test(ninfer_rope_cli_test
+  SOURCES test_rope_cli.cpp ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp
+  LIBRARIES ninfer_serve ninfer_engine)
+target_include_directories(ninfer_rope_cli_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
+# Host-only: no artifact, no device. The CLI stop-policy and diagnostic option surface that the rope
+# test does not cover -- principally `--ignore-eos`, whose default decides whether a request honors
+# the checkpoint's own stop tokens. Same compile-in as above: apps/ninfer is an executable, not a
+# library.
+ninfer_add_test(ninfer_cli_options_test
+  SOURCES test_cli_options.cpp ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
 ninfer_add_test(ninfer_request_log_test
   SOURCES test_request_log.cpp
   LIBRARIES ninfer_serve)

@@ -264,12 +264,18 @@ int main(int argc, char** argv) {
         request.execution.thinking.budget         = cli.thinking_budget;
         request.stop.token_ids                    = cli.stop_token_ids;
         request.stop.strings                      = cli.stop_strings;
+        request.stop.include_model_defaults       = !cli.ignore_eos;
         request.output.raw                        = cli.raw_output;
 
         ninfer::EngineOptions engine_options;
         engine_options.artifact_path  = cli.artifact_path;
         engine_options.device         = cli.device;
+        engine_options.tp             = cli.tp;
+        engine_options.devices        = cli.devices;
         engine_options.max_context    = cli.max_context;
+        engine_options.rope_mode      = cli.rope_mode;
+        engine_options.yarn_factor    = cli.yarn_factor;
+        engine_options.yarn_origin    = cli.yarn_origin;
         engine_options.kv_capacity    = cli.kv_capacity;
         engine_options.prefill_chunk  = cli.prefill_chunk;
         engine_options.kv_cache       = cli.kv_cache;
