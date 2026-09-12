@@ -2,15 +2,26 @@
 build/
 build-*/
 cmake-build-*/
+Testing/
+_deps/
 *.o
 *.obj
+*.d
 *.so
 *.a
+*.lib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
 compile_commands.json
 CMakeUserPresets.json
 .cache/
 
 # CUDA / profiling artifacts
+*.cubin
+*.fatbin
 *.nsys-rep
 *.ncu-rep
 *.qdrep
@@ -21,6 +32,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
+.venv-*/
 venv/
 *.egg-info/
 
@@ -42,6 +54,8 @@ out/
 /tmp-*/
 /AGENTS.override.md
 /logs/
+models/
+vcpkg_installed/
 *.log
 *.tmp
 /core
@@ -55,10 +69,26 @@ tools/freq_corpus/fixtures/*
 # Editor / OS
 .vscode/
 .idea/
+.vs/
+*.suo
+*.user
+*.VC.db
+*.VC.VC.opendb
+ipch/
+*.tlog/
 *.swp
 .DS_Store
+Thumbs.db
 profiles/
 .chatgpt/
+benchmark_results/
+
+# Local release products. Keep the publishing guide, upload archives as GitHub Release assets.
+dist/*
+!dist/README.md
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
+
+# Out-of-tree experimental benches staged on this branch but not part of any PR yet.
+tools/phase2a/

@@ -36,6 +36,15 @@ std::uint32_t normalized_private_capacity(const ContextCacheOptions& options) {
     return *options.max_private_continuations;
 }
 
+qwen3_6::detail::YarnParams yarn_params(const SequencePlanImpl& plan) {
+    return qwen3_6::detail::YarnParams{
+        .factor        = static_cast<float>(plan.yarn_factor),
+        .original_max  = static_cast<int>(plan.yarn_origin),
+        .theta         = TextConfig::rope_theta,
+        .rotary_pairs  = TextConfig::rotary_dim / 2,
+    };
+}
+
 using Clock = std::chrono::steady_clock;
 
 std::uint64_t elapsed_ns(Clock::time_point started) noexcept {
@@ -727,9 +736,30 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
 
 } // namespace
 
-ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
-                                 DeviceContext& device_in, const StartupObserver& startup_observer)
-    : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
+PeerRuntime::PeerRuntime(DeviceContext& peer_device, const LoadedModelData& peer_model,
+                         const SequencePlanImpl& plan)
+    : device(peer_device), model(peer_model), persistent(plan.persistent.bytes),
+      workspace_storage(plan.workspace.capacity),
+      work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}) {
+    const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
+    decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
+    state_images =
+        std::make_unique<qwen3_6::StateImageDevicePool>(backing, plan.persistent.state_images);
+    if (plan.persistent.replay_records) {
+        replay_records.emplace(backing, *plan.persistent.replay_records);
+        replay_fold.emplace(*replay_records, state_images->linear().all_layers_view());
+    }
+    io             = qwen3_6::RoundState(backing, plan.persistent.round);
+    prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
+    token_counts   = plan.persistent.token_counts.bind(backing);
+}
+
+ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
+                                                                 const LoadedModelData* peer_model, const SequencePlanImpl& plan,
+                                                                 ExecutionContext& execution_in,
+                                                                 const StartupObserver& startup_observer)
+        : model(model_in), execution(execution_in), device(execution_in.primary()), tp(execution_in.tp),
+            capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), context_cache(plan.context_cache),
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
@@ -741,6 +771,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
+    rope_mode(plan.rope_mode), effective_max_context(plan.effective_max_context),
+    yarn_mscale(qwen3_6::detail::yarn_rope_mscale(yarn_params(plan))),
       continuation_states(continuation_capacity), continuation_slots(continuation_capacity),
       shared_prefix_states(shared_prefix_capacity), shared_prefix_slots(shared_prefix_capacity),
       round_host(sizeof(TokenId)),
@@ -760,10 +792,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                       ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_6::DFlashDecodeIngress) +
                                                              sizeof(qwen3_6::DFlashDecodeEgress))
                       : std::nullopt),
-      context_source_ready_(device_in), context_completion_(device_in),
-      context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream),
-                               CudaEventTimer(device_in, device_in.transfer_stream),
-                               CudaEventTimer(device_in, device_in.transfer_stream)} {
+    context_source_ready_(device), context_completion_(device),
+    context_transfer_timers_{CudaEventTimer(device, device.transfer_stream),
+                     CudaEventTimer(device, device.transfer_stream),
+                     CudaEventTimer(device, device.transfer_stream)} {
     if (model.weights_arena == nullptr) {
         throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
     }
@@ -810,6 +842,20 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             // Created once, here, for the same reason PeerEvents is: cudaEventCreate is not
             // capturable, and the fork/join pair must outlive every capture.
             graph_bridge.emplace(execution.dev[0]->device, execution.dev[1]->device);
+            // Mailbox transport for the CAPTURED collectives: one pinned host slot per captured
+            // call site, sized for the widest single-request exchange -- the MTP verify
+            // activation [hidden, draft_window + 1] in BF16 (the same bound the staged path
+            // must hold, and the shape every decode round's 128 reductions replay). Payloads
+            // beyond a slot (multi-request batches, prefill) run the staged path instead, by
+            // construction of ops::allreduce_sum's mailbox selection. Slots must cover every
+            // captured call site across all captured profiles; 2048 covers the single-request
+            // graph families (64 layers x 2 collectives + MTP head, per context class and
+            // batch profile) with margin, and the collective falls back loudly to the staged
+            // path if a future topology ever exhausts them.
+            const std::size_t mailbox_slot_bytes =
+                static_cast<std::size_t>(TextConfig::hidden) * (draft_window + 1) * 2;
+            constexpr int kMailboxSlots = 2048;
+            peer_mailbox.emplace(execution, mailbox_slot_bytes, kMailboxSlots);
         }
     }
     if (rope_mode == RopeMode::Yarn) {
@@ -819,8 +865,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         // at construction and stay valid for the life of the Program. At tp 2 each rank ropes its
         // own head-local q/k on its own device and stream: rank 1 cannot dereference rank 0's
         // table, so each device gets its own copy of the same 128 bytes.
-        const std::vector<float> table =
-            qwen3_6::detail::yarn_scale(plan_yarn_params(plan)).first;
+        const std::vector<float> table = qwen3_6::detail::yarn_scale(yarn_params(plan)).first;
         if (table.size() != static_cast<std::size_t>(TextConfig::rotary_dim / 2)) {
             throw std::logic_error("YaRN frequency table does not match the rotary geometry");
         }
@@ -828,7 +873,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         for (int rank = 0; rank < tp; ++rank) {
             const auto slot            = static_cast<std::size_t>(rank);
             DeviceContext& rank_device = *execution.dev[slot];
-            const ScopedDevice scope(rank_device.device);
+            rank_device.bind_to_current_thread();
             rope_frequency_storage[slot] = DeviceBuffer(table_bytes);
             CUDA_CHECK(cudaMemcpyAsync(rope_frequency_storage[slot].p, table.data(), table_bytes,
                                        cudaMemcpyHostToDevice, rank_device.stream));
@@ -839,6 +884,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                 static_cast<const float*>(rope_frequency_storage[slot].p),
                 static_cast<float>(yarn_mscale)};
         }
+            device.bind_to_current_thread();
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     if (!plan.context_cache.max_private_continuations || !plan.context_cache.max_shared_prefixes) {
@@ -1046,6 +1092,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             sizeof(qwen3_6::DFlashDecodeIngress));
         *dflash_host_ingress = {};
         *dflash_host_egress  = {};
+        if (peer) {
+            dflash_peer_host.emplace(sizeof(qwen3_6::DFlashDecodeIngress));
+            dflash_peer_host_ingress =
+                static_cast<qwen3_6::DFlashDecodeIngress*>(dflash_peer_host->data());
+            *dflash_peer_host_ingress = {};
+        }
     }
     if (io.dflash_prefill) {
         CUDA_CHECK(cudaMemsetAsync(io.dflash_prefill->produced_count.data, 0,
@@ -1078,7 +1130,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                                .device           = &peer->device,
                                                .model            = &peer->model,
                                                .work             = &peer->work,
-                                               .linear_attention = &peer->decoder->linear_attention,
+                                               .linear_attention = &peer->state_images->linear(),
                                                .io               = &peer->io,
                                                .prefill_hidden   = &peer->prefill_hidden,
                                                .text_cache       = &peer->decoder->text_kv,
@@ -1086,7 +1138,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                                .replay_records   = peer->replay_records
                                                                        ? &*peer->replay_records
                                                                        : nullptr,
+                                               .continuation_hidden_store =
+                                                   &peer->state_images->continuation_hidden_store(),
                                                .mtp_host_ingress = mtp_peer_host_ingress,
+                                               .dflash_host_ingress = dflash_peer_host_ingress,
                                                .graph_bridge = graph_bridge ? &*graph_bridge
                                                                             : nullptr});
         if (peer->replay_records.has_value() != replay_records.has_value()) {
@@ -1216,6 +1271,7 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
                 {device, model, work, state_images->linear(), nullptr, io, prefill_hidden,
                  prefill_chunk, proposal_head},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
+                {},
                 {},
                 decoder->text_kv,
                 nullptr,
@@ -9069,6 +9125,7 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                      proposal_head},
                     text_kv_view(sequence),
                     mtp_kv_view(sequence),
+                    mtp_kv_view_peer(sequence),
                     decoder->text_kv,
                     decoder->mtp_cache(),
                     dflash ? &*dflash : nullptr,
@@ -10231,12 +10288,12 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
         // geometry FoldGeometry<48, 8, 24, 5120> this call resolves to is registered explicitly;
         // without that registration the fold would reject the peer's record shape outright.
         if (peer) {
-            if (!peer->replay_records) {
+            if (!peer->replay_records || !peer->replay_fold) {
                 throw std::logic_error("peer speculative round has no ReplaySSM records");
             }
-            const ScopedDevice scope(peer->device.device);
-            ops::gdn_replay_fold(
-                *peer->replay_records, peer->decoder->linear_attention.all_layers_view(),
+            const schedule::CurrentDevice scope;
+            peer->device.bind_to_current_thread();
+            peer->replay_fold->execute(
                 std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                 peer->device.stream);
         }
@@ -11042,10 +11099,11 @@ qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view(const SequenceState& sequ
 qwen3_6::PagedKVCacheView
 ProgramImplCore::mtp_kv_view_peer(const SequenceState& sequence) const {
     if (speculative_backend != SpeculativeBackend::Mtp || !peer) { return {}; }
-    if (peer->decoder->mtp_cache() == nullptr || !sequence.kv || !sequence.kv->backend_peer) {
+    if (peer->decoder->mtp_cache() == nullptr || !sequence.kv ||
+        !sequence.backend_kv_peer_row) {
         throw std::logic_error("sequence has no peer MTP KV allocation");
     }
-    return peer->decoder->mtp_cache()->execution_view(*sequence.kv->backend_peer);
+    return peer->decoder->mtp_cache()->execution_view(*sequence.backend_kv_peer_row);
 }
 
 void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
@@ -11081,6 +11139,17 @@ void ProgramImplCore::ordered_reset(SequenceState& sequence) {
 void ProgramImplCore::prepare_graphs() {
     if (!use_cuda_graph) { return; }
     nvtx::ScopedRange prepare_range(nvtx::Name::CudaGraphPrepare, nvtx::Category::Graph);
+
+    const auto on_peer = [&](auto&& body) {
+        if (!peer) { return; }
+        const schedule::CurrentDevice scope;
+        peer->device.bind_to_current_thread();
+        body(*peer);
+    };
+    const auto synchronize_all = [&] {
+        if (peer) { peer->device.synchronize(); }
+        device.synchronize();
+    };
 
     std::array<StateImageHandle, kMaximumConcurrency> capture_states{};
     for (std::uint32_t row = 0; row < max_concurrency; ++row) {
@@ -11242,6 +11311,7 @@ void ProgramImplCore::prepare_graphs() {
                 dflash_host_ingress->state_destination_slots[row] = capture_state_slot(row);
                 dflash_host_ingress->sampling[row]                = {};
             }
+            publish_peer_dflash_ingress();
         }
         if (io.mtp_decode) {
             *mtp_host_ingress          = {};
@@ -11412,11 +11482,11 @@ void ProgramImplCore::prepare_graphs() {
             1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                    capacity, static_cast<std::uint64_t>(code_warm.max) + draft_window + 1ULL))};
         prepare_representative(code_warm.min, 1);
-        device.synchronize();
+        synchronize_all();
         schedule::dflash_decode_batch(dflash_state, 1, draft_window,
                                       dflash_envelopes(code_warm.min, code_warm.max, draft_window),
                                       code_warm_target, nullptr);
-        device.synchronize();
+        synchronize_all();
 
         dflash_graphs.profiles.reserve(batch_one_profiles.size() * max_concurrency);
         for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
@@ -11461,7 +11531,8 @@ void ProgramImplCore::prepare_graphs() {
                                  synchronize_all);
     }
     if (is_masked_draft_backend(speculative_backend)) {
-        instantiate_graph_family(dflash_graphs, "DFlash", device, prepare_representative);
+        instantiate_graph_family(dflash_graphs, "DFlash", device, prepare_representative,
+                                 synchronize_all);
     }
 
     clear_stable_controls();
@@ -11521,6 +11592,49 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
     CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
                                sizeof(request.sampling_host), cudaMemcpyHostToDevice,
                                device.stream));
+}
+
+void ProgramImplCore::publish_peer_dflash_ingress() {
+    if (dflash_peer_host_ingress == nullptr || dflash_host_ingress == nullptr) { return; }
+    *dflash_peer_host_ingress = *dflash_host_ingress;
+    for (ops::SamplingConfig& sampling : dflash_peer_host_ingress->sampling) {
+        sampling.token_counts = nullptr;
+    }
+}
+
+Tensor ProgramImplCore::token_counts_lane(const Tensor& storage, std::uint32_t lane) {
+    return storage.slice(1, static_cast<std::int32_t>(lane), 1).view({TextConfig::token_domain});
+}
+
+void ProgramImplCore::publish_peer_token_counts(const SequenceState& sequence) {
+    if (!peer || requests[sequence.lane].sampling_host.token_counts == nullptr) { return; }
+    const Tensor source = token_counts_lane(token_counts, sequence.lane);
+    const Tensor target = token_counts_lane(peer->token_counts, sequence.lane);
+    CUDA_CHECK(cudaMemcpyAsync(target.data, source.data, source.bytes(), cudaMemcpyDeviceToDevice,
+                               device.stream));
+}
+
+void ProgramImplCore::publish_peer_mtp_ingress(std::span<const std::uint32_t> lanes) {
+    if (mtp_peer_host_ingress == nullptr || mtp_host_ingress == nullptr) { return; }
+    *mtp_peer_host_ingress = *mtp_host_ingress;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        ops::SamplingConfig& sampling = mtp_peer_host_ingress->sampling[row];
+        if (sampling.token_counts == nullptr) { continue; }
+        sampling.token_counts =
+            static_cast<std::int32_t*>(token_counts_lane(peer->token_counts, lanes[row]).data);
+    }
+}
+
+void ProgramImplCore::publish_peer_ordinary_ingress() {
+    if (ordinary_peer_host_ingress == nullptr || ordinary_host_ingress == nullptr) { return; }
+    *ordinary_peer_host_ingress = *ordinary_host_ingress;
+    for (ops::SamplingConfig& sampling : ordinary_peer_host_ingress->sampling) {
+        sampling.token_counts = nullptr;
+    }
+}
+
+void ProgramImplCore::enable_peer_egress_check(bool enabled) noexcept {
+    peer_egress_check_enabled = enabled;
 }
 
 void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
@@ -12383,11 +12497,13 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1U,
                                       backend_kv_cache() ? frontier : 0U);
         }
+        publish_peer_dflash_ingress();
 
         schedule::DFlashBatchContext schedule_state{{device, model, work, state_images->linear(),
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
-                                                     proposal_head, rope_frequency},
+                                                     proposal_head, rope_frequency,
+                                                     peer_core ? &*peer_core : nullptr},
                                                     decoder->text_kv,
                                                     *dflash,
                                                     *io.dflash_decode,

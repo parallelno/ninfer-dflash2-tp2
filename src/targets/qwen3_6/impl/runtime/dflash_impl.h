@@ -36,6 +36,79 @@
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
 
+struct DFlashVerifyView {
+    Tensor anchors;
+    Tensor frontiers;
+    Tensor extents;
+    Tensor valid_columns;
+    Tensor target_rope;
+    Tensor text_rows;
+    Tensor state_sources;
+    Tensor state_destinations;
+    Tensor drafts;
+    Tensor verify_ids;
+    Tensor target_positions;
+    Tensor target_tokens;
+    Tensor target_logits;
+    Tensor target_hidden;
+    Tensor selected_hidden;
+    Tensor licensed_tokens;
+    Tensor licensed_counts;
+    Tensor accepted;
+    const ops::SamplingConfig* sampling = nullptr;
+};
+
+DFlashVerifyView slice_dflash_verify(qwen3_6::DFlashDecodeState& frame,
+                                     std::int32_t batch_size) {
+    return DFlashVerifyView{
+        .anchors            = frame.anchors.slice(0, 0, batch_size),
+        .frontiers          = frame.execution_frontiers.slice(0, 0, batch_size),
+        .extents            = frame.proposal_extents.slice(0, 0, batch_size),
+        .valid_columns      = frame.target_valid_columns.slice(0, 0, batch_size),
+        .target_rope        = frame.target_rope_positions.slice(1, 0, batch_size),
+        .text_rows          = frame.text_kv_table_rows.slice(0, 0, batch_size),
+        .state_sources      = frame.state_source_slots.slice(0, 0, batch_size),
+        .state_destinations = frame.state_destination_slots.slice(0, 0, batch_size),
+        .drafts             = frame.draft_tokens.slice(1, 0, batch_size),
+        .verify_ids         = frame.verify_ids.slice(1, 0, batch_size),
+        .target_positions   = frame.verify_positions.slice(1, 0, batch_size),
+        .target_tokens      = frame.target_argmax.slice(1, 0, batch_size),
+        .target_logits      = frame.target_logits.slice(2, 0, batch_size),
+        .target_hidden      = frame.target_hidden.slice(2, 0, batch_size),
+        .selected_hidden    = frame.target_continuation_hidden.slice(1, 0, batch_size),
+        .licensed_tokens    = frame.licensed_tokens.slice(1, 0, batch_size),
+        .licensed_counts    = frame.licensed_counts.slice(0, 0, batch_size),
+        .accepted           = frame.accepted_drafts.slice(0, 0, batch_size),
+        .sampling           = frame.sampling,
+    };
+}
+
+TargetVerifyFrameView target_verify_view(const DFlashVerifyView& view,
+                                         const GdnReplayRecords* records) {
+    return TargetVerifyFrameView{
+        .ids                     = view.verify_ids,
+        .cache_positions         = view.target_positions,
+        .rope_positions          = view.target_rope,
+        .valid_columns           = view.valid_columns,
+        .kv_table_rows           = view.text_rows,
+        .state_source_slots      = view.state_sources,
+        .state_destination_slots = view.state_destinations,
+        .target_hidden           = view.target_hidden,
+        .target_logits           = view.target_logits,
+        .target_tokens           = view.target_tokens,
+        .drafts                  = view.drafts,
+        .current_extents         = view.extents,
+        .frontiers               = view.frontiers,
+        .anchors                 = view.anchors,
+        .licensed_tokens         = view.licensed_tokens,
+        .licensed_counts         = view.licensed_counts,
+        .accepted_drafts         = view.accepted,
+        .selected_hidden         = view.selected_hidden,
+        .replay_records          = records,
+        .sampling                = view.sampling,
+    };
+}
+
 void require_dflash_state(const PrefillContext& state) {
     if (state.dflash == nullptr || !state.execution.model.dflash.has_value()) {
         throw std::logic_error("masked draft schedule requires its weights and state");
@@ -489,6 +562,20 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
+        const std::optional<TpExecution> tp = tp_execution(state.execution);
+        if (tp) {
+            if (!tp->io->dflash_decode.has_value() ||
+                state.execution.peer->dflash_host_ingress == nullptr) {
+                throw std::logic_error(
+                    "tensor-parallel DFlash decode requires a peer frame and ingress record");
+            }
+            const CurrentDevice restore;
+            CUDA_CHECK(cudaSetDevice(tp->device->device));
+            CUDA_CHECK(cudaMemcpyAsync(tp->io->dflash_decode->ingress.data,
+                                       state.execution.peer->dflash_host_ingress,
+                                       sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
+                                       tp->device->stream));
+        }
 
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers          = frame.execution_frontiers.slice(0, 0, batch_size);
@@ -524,21 +611,41 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                      state_destinations, dflash_rows, envelopes.append);
 
         propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
+        std::optional<DFlashVerifyView> peer_verify;
+        if (tp) {
+            peer_verify.emplace(slice_dflash_verify(*tp->io->dflash_decode, batch_size));
+            const ops::PeerEvents& events = *tp->events;
+            CUDA_CHECK(cudaEventRecord(events.inputs_ready(0), state.execution.device.stream));
+            CUDA_CHECK(cudaSetDevice(tp->device->device));
+            CUDA_CHECK(cudaStreamWaitEvent(tp->device->stream, events.inputs_ready(0), 0));
+            CUDA_CHECK(cudaMemcpyAsync(peer_verify->drafts.data, drafts.data, drafts.bytes(),
+                                       cudaMemcpyDeviceToDevice, tp->device->stream));
+            CUDA_CHECK(cudaEventRecord(events.pull_done(1), tp->device->stream));
+            CUDA_CHECK(cudaSetDevice(state.execution.device.device));
+            CUDA_CHECK(cudaStreamWaitEvent(state.execution.device.stream, events.pull_done(1), 0));
+        }
         ops::speculative_prepare_verify_inputs(anchors, drafts, frontiers, extents, verify_ids,
                                                target_positions, state.execution.device.stream);
+        if (peer_verify) {
+            const CurrentDevice restore;
+            CUDA_CHECK(cudaSetDevice(tp->device->device));
+            ops::speculative_prepare_verify_inputs(
+                peer_verify->anchors, peer_verify->drafts, peer_verify->frontiers,
+                peer_verify->extents, peer_verify->verify_ids, peer_verify->target_positions,
+                tp->device->stream);
+        }
 
         TextContext card(state.execution.device, state.execution.model, state.execution.work,
                          state.execution.rope_frequency, {}, state.execution.linear_attention,
                          state.execution.io, state.execution.prefill_hidden,
-                         state.execution.prefill_chunk, 0, {}, &state.text_cache);
+                         state.execution.prefill_chunk, 0, {}, &state.text_cache, nullptr,
+                         tp ? &*tp : nullptr);
         DFlashFeatureSink sink =
             batch_feature_sink_impl<Variant>(state, active_lanes, valid_columns, width, batch_size);
         {
             nvtx::ScopedRange target_range(nvtx::Name::DecodeDFlashTarget, nvtx::Category::DFlash,
                                            static_cast<std::uint64_t>(width) * batch_size);
-            target_verify_accept(
-                state.execution, state.continuation_hidden_store, card,
-                TargetVerifyFrameView{
+            TargetVerifyFrameView local_verify{
                     .ids                     = verify_ids,
                     .cache_positions         = target_positions,
                     .rope_positions          = target_rope,
@@ -565,8 +672,15 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                     .replay_records  = state.execution.replay_records,
                     .sampling        = frame.sampling,
                     .feature_sink    = &sink,
-                },
-                target_envelope);
+                };
+            if (peer_verify) {
+                target_verify_accept(
+                    state.execution, state.continuation_hidden_store, card, local_verify,
+                    target_verify_view(*peer_verify, tp->replay_records), target_envelope);
+            } else {
+                target_verify_accept(state.execution, state.continuation_hidden_store, card,
+                                     local_verify, target_envelope);
+            }
         }
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_6::DFlashDecodeEgress), cudaMemcpyDeviceToHost,

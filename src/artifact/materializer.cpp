@@ -132,7 +132,8 @@ DeviceArena& MaterializedArtifact::device_arena(int device) {
 }
 
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
-                                 DeviceContext& device, const StartupObserver* startup_observer) {
+                                 std::span<DeviceContext* const> devices,
+                                 const StartupObserver* startup_observer) {
     const StartupObserver no_startup_observer;
     const StartupObserver& startup =
         startup_observer == nullptr ? no_startup_observer : *startup_observer;
@@ -142,6 +143,11 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     }
     StartupPhaseScope materialize_phase(startup, StartupPhase::WeightsMaterialize,
                                         StartupProgressUnit::Bytes, total);
+    const int device_count = plan.device_count;
+    if (device_count < 1 || device_count > static_cast<int>(kMaximumDevices) ||
+        devices.size() != static_cast<std::size_t>(device_count)) {
+        throw ArtifactError("materialization device count does not match the plan");
+    }
     MaterializedArtifact out;
     out.objects_.resize(plan.object_count);
     out.stats_.device_count = device_count;
@@ -158,14 +164,14 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
             // alignment gaps between its planes are not covered by any copy. The layouts define
             // those gap bytes as zero; make them so rather than leaving allocator residue.
             //
-            // This MUST be stream-ordered on the same stream the copies use. load_stream is
+            // This MUST be stream-ordered on the same stream the copies use. transfer_stream is
             // created with cudaStreamNonBlocking, so it does not synchronize with the legacy
             // default stream that synchronous-API cudaMemset would run on -- a multi-GiB fill
             // could still be in flight when the first weight copies land and would silently zero
-            // them. cudaMemsetAsync on load_stream orders the fill strictly before every copy.
+            // them. cudaMemsetAsync on transfer_stream orders the fill before every copy.
             CUDA_CHECK(cudaMemsetAsync(out.device_arena_[slot]->base(), 0,
                                        static_cast<std::size_t>(capacity),
-                                       devices[slot]->load_stream));
+                                       devices[slot]->transfer_stream));
         }
         out.stats_.per_device_capacity_bytes[slot] = capacity;
         out.stats_.device_capacity_bytes =
@@ -209,12 +215,14 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         if (actual_offset != placement.offset) {
             throw ArtifactError("materialization plan does not match artifact payload");
         }
-        out.objects_.at(placement.object.index).device = storage.data;
+        out.objects_.at(placement.object.index).device[slot]       = storage.data;
+        out.objects_.at(placement.object.index).device_bytes[slot] = placement.bytes;
         ranges.push_back(CopyRange{
             .source_begin = payload.absolute_offset,
             .source_end   = checked_add(payload.absolute_offset, placement.bytes,
                                         "artifact tensor source range overflows u64"),
             .destination  = static_cast<std::byte*>(storage.data),
+            .device       = placement.device,
         });
     }
     if (ranges.empty()) { throw ArtifactError("materialization plan has no device tensors"); }
@@ -284,8 +292,8 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     out.stats_.peak_staging_bytes = staging_bytes;
     materialize_phase.progress(0, total);
 
-    std::size_t next_slot  = 0;
-    std::size_t next_range = 0;
+    std::size_t next_slot        = 0;
+    std::size_t first_unfinished = 0;
     const auto start       = std::chrono::steady_clock::now();
     for (const ReadSpan& span : read_spans) {
         for (std::uint64_t source = span.begin; source < span.end; source += slot_bytes) {
@@ -336,7 +344,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                             static_cast<std::size_t>(copy_begin - range.source_begin),
                         static_cast<std::byte*>(slot.buffer.data()) +
                             static_cast<std::size_t>(copy_begin - source),
-                        amount, cudaMemcpyHostToDevice, device.transfer_stream));
+                        amount, cudaMemcpyHostToDevice, devices[device_slot]->transfer_stream));
                     copied =
                         checked_add(copied, amount, "artifact copied byte count overflows u64");
                     out.stats_.per_device_h2d_bytes[device_slot] += amount;
@@ -344,14 +352,10 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                 }
                 if (fed) {
                     CUDA_CHECK(cudaEventRecord(slot.events[device_slot],
-                                               devices[device_slot]->load_stream));
+                                               devices[device_slot]->transfer_stream));
                     slot.pending[device_slot] = true;
                 }
             }
-            next_range = range_index;
-            CUDA_CHECK(cudaEventRecord(slot.event, device.transfer_stream));
-            slot.pending = true;
-
             if (copied != last_published && copied < total) {
                 last_published = copied;
                 materialize_phase.progress(copied, total);
@@ -359,8 +363,11 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         }
     }
     for (const auto& slot : slots) { slot->wait(); }
-    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
-    if (copied != total || next_range != ranges.size()) {
+    for (int index = 0; index < device_count; ++index) {
+        CUDA_CHECK(
+            cudaStreamSynchronize(devices[static_cast<std::size_t>(index)]->transfer_stream));
+    }
+    if (copied != total) {
         throw ArtifactError("direct materialization did not cover every tensor byte");
     }
     out.stats_.h2d_bytes = copied;
@@ -372,23 +379,25 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
 }
 
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
-                                 ExecutionContext& execution, LoadProgress* progress) {
+                                 ExecutionContext& execution,
+                                 const StartupObserver* startup_observer) {
     std::array<DeviceContext*, kMaximumDevices> devices{};
     std::size_t count = 0;
     for (auto& slot : execution.dev) {
         if (slot.has_value()) { devices[count++] = &slot.value(); }
     }
     return materialize(reader, plan, std::span<DeviceContext* const>(devices.data(), count),
-                       progress);
+                       startup_observer);
 }
 
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
-                                 DeviceContext& device, LoadProgress* progress) {
+                                 DeviceContext& device,
+                                 const StartupObserver* startup_observer) {
     if (plan.device_count != 1) {
         throw ArtifactError("a multi-device materialization plan needs an ExecutionContext");
     }
     DeviceContext* one = &device;
-    return materialize(reader, plan, std::span<DeviceContext* const>(&one, 1), progress);
+    return materialize(reader, plan, std::span<DeviceContext* const>(&one, 1), startup_observer);
 }
 
 } // namespace ninfer::artifact

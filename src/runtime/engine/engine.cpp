@@ -90,11 +90,27 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     return options;
 }
 
-DeviceContext initialize_device(const EngineOptions& options) {
+std::vector<int> resolve_execution_device_ids(const EngineOptions& options) {
+    if (options.tp != 1 && options.tp != 2) {
+        throw std::invalid_argument("EngineOptions.tp must be 1 or 2");
+    }
+    if (options.devices.empty()) {
+        if (options.tp != 1) {
+            throw std::invalid_argument("--tp 2 requires an explicit --devices list");
+        }
+        return {options.device};
+    }
+    if (options.devices.size() != static_cast<std::size_t>(options.tp)) {
+        throw std::invalid_argument("EngineOptions.devices size must equal tp");
+    }
+    return options.devices;
+}
+
+ExecutionContext initialize_execution(const EngineOptions& options) {
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
-    DeviceContext device(options.device);
+    ExecutionContext execution(resolve_execution_device_ids(options));
     phase.complete();
-    return device;
+    return execution;
 }
 
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
@@ -230,9 +246,10 @@ public:
 
     explicit Impl(EngineOptions engine_options)
         : options(normalize_engine_options(std::move(engine_options))),
-          device(initialize_device(options)) {
+                    execution(initialize_execution(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
-        auto constructed  = targets::construct_target(options, device);
+                DeviceContext& device = execution.primary();
+                auto constructed      = targets::construct_target(options, execution);
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
         sampling_defaults = constructed.sampling_defaults;
@@ -260,11 +277,13 @@ public:
     }
 
     ~Impl() noexcept {
-        device.bind_to_current_thread_noexcept();
+        execution.primary().bind_to_current_thread_noexcept();
         core.emplace<std::monostate>();
-        try {
-            device.synchronize();
-        } catch (...) {}
+        for (int rank = execution.tp - 1; rank >= 0; --rank) {
+            try {
+                execution.dev[static_cast<std::size_t>(rank)]->synchronize();
+            } catch (...) {}
+        }
     }
 
     EngineOptions options;
@@ -552,7 +571,7 @@ std::vector<std::uint16_t> Engine::debug_last_round_logits_bf16() const {
                 return executor->debug_last_round_logits_bf16();
             }
         },
-        impl_->executor);
+        impl_->core);
 }
 
 void Engine::debug_enable_logit_capture(bool enabled) {
@@ -566,7 +585,7 @@ void Engine::debug_enable_logit_capture(bool enabled) {
                 executor->debug_enable_logit_capture(enabled);
             }
         },
-        impl_->executor);
+        impl_->core);
 }
 
 void Engine::debug_enable_peer_egress_check(bool enabled) {
@@ -580,7 +599,7 @@ void Engine::debug_enable_peer_egress_check(bool enabled) {
                 executor->debug_enable_peer_egress_check(enabled);
             }
         },
-        impl_->executor);
+        impl_->core);
 }
 
 std::pair<std::uint64_t, std::uint64_t> Engine::debug_peer_egress_check_counts() const {
@@ -594,7 +613,7 @@ std::pair<std::uint64_t, std::uint64_t> Engine::debug_peer_egress_check_counts()
                 return executor->debug_peer_egress_check_counts();
             }
         },
-        impl_->executor);
+        impl_->core);
 }
 
 void Engine::reset_memory_peaks() noexcept {

@@ -36,7 +36,8 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
         &launch_tile<8 * (static_cast<int>(Offsets) + 1)>...};
 }
 
-constexpr auto kLaunchers = make_launchers(std::make_index_sequence<6>{});
+constexpr auto kLaunchers =
+    make_launchers<Fp8VocabularyGeometry>(std::make_index_sequence<6>{});
 
 } // namespace
 

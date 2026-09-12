@@ -13,15 +13,16 @@ namespace {
 
 using Geometry = Fp8GdnInputGeometry;
 
-template <int ActiveTokens>
+template <class LaunchGeometry, class Output, int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                   cudaStream_t stream) {
-    using Schedule = typename Fp8LinearSmallTProductionSchedule<Geometry, ActiveTokens>::Type;
+    using Schedule =
+        typename Fp8LinearSmallTProductionSchedule<LaunchGeometry, ActiveTokens>::Type;
     constexpr int kTokenTiles = (ActiveTokens + Schedule::kTokenTile - 1) / Schedule::kTokenTile;
-    constexpr int kBlocks     = (Geometry::kOutputRows / Schedule::kRowsPerCta) * kTokenTiles;
-    const Fp8GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
-                                   static_cast<__nv_bfloat16*>(z.data)};
-    fp8_small_t_kernel<Geometry, ActiveTokens, Schedule>
+    constexpr int kBlocks = (LaunchGeometry::kOutputRows / Schedule::kRowsPerCta) * kTokenTiles;
+    const Output output{static_cast<__nv_bfloat16*>(qkv.data),
+                        static_cast<__nv_bfloat16*>(z.data)};
+    fp8_small_t_kernel<LaunchGeometry, ActiveTokens, Schedule>
         <<<kBlocks, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
@@ -67,9 +68,9 @@ void fp8_gdn_input_matrix_launch(const Tensor& x, const Weight& weight, Tensor& 
                                  cudaStream_t stream) {
     // SIMT for the latency regime, bounded MMA column capacities, then amortized weight decode.
     const int columns = x.ne[1];
-    if (columns == 2) return launch_exact<2>(x, weight, qkv, z, stream);
-    if (columns == 3) return launch_exact<3>(x, weight, qkv, z, stream);
-    if (columns == 4) return launch_exact<4>(x, weight, qkv, z, stream);
+    if (columns == 2) return launch_exact<Geometry, Fp8GdnInputOutput, 2>(x, weight, qkv, z, stream);
+    if (columns == 3) return launch_exact<Geometry, Fp8GdnInputOutput, 3>(x, weight, qkv, z, stream);
+    if (columns == 4) return launch_exact<Geometry, Fp8GdnInputOutput, 4>(x, weight, qkv, z, stream);
     if (columns <= 8) return launch_small_mma<8>(x, weight, qkv, z, stream);
     if (columns <= 16) return launch_small_mma<16>(x, weight, qkv, z, stream);
     if (columns <= 24) return launch_small_mma<24>(x, weight, qkv, z, stream);
@@ -79,6 +80,18 @@ void fp8_gdn_input_matrix_launch(const Tensor& x, const Weight& weight, Tensor& 
     if (columns <= 96)
         return launch_gemm<Fp8A16GemmSchedule<64, 96, 128, 64, 16, 1, 2>>(x, weight, qkv, z, stream);
     return launch_gemm<Fp8A16GemmSchedule<64, 128, 64, 32, 16, 2, 2>>(x, weight, qkv, z, stream);
+}
+
+void fp8_gdn_input_small_t_launch_shard(const Tensor& x, const Weight& weight, Tensor& qkv,
+                                        Tensor& z, cudaStream_t stream) {
+    using Geometry = Fp8GdnInputTp2ColumnGeometry;
+    using Output   = Fp8GdnInputShardOutput<Geometry>;
+    switch (x.ne[1]) {
+    case 2: return launch_exact<Geometry, Output, 2>(x, weight, qkv, z, stream);
+    case 3: return launch_exact<Geometry, Output, 3>(x, weight, qkv, z, stream);
+    case 4: return launch_exact<Geometry, Output, 4>(x, weight, qkv, z, stream);
+    default: throw std::invalid_argument("fp8 gdn_input_proj column-parallel small-T: unsupported T");
+    }
 }
 
 } // namespace ninfer::ops::detail

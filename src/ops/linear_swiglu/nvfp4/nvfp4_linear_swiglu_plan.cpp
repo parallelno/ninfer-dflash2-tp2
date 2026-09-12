@@ -94,12 +94,12 @@ std::size_t capacity_bytes_impl(LinearPolicy policy, std::int32_t min_tokens,
 
     std::size_t maximum = 0;
     if (min_tokens <= kFusedMaxTokens && max_tokens >= 5) {
-        maximum = fused_workspace_bytes(std::min(max_tokens, kFusedMaxTokens));
+        maximum = fused_workspace_bytes<Geometry>(std::min(max_tokens, kFusedMaxTokens));
     }
     if (max_tokens >= kTmaBlockM) {
         const std::int32_t largest_fused = max_tokens - (max_tokens % kTmaBlockM);
         if (largest_fused >= std::max(min_tokens, kTmaBlockM)) {
-            maximum = std::max(maximum, fused_workspace_bytes(largest_fused));
+            maximum = std::max(maximum, fused_workspace_bytes<Geometry>(largest_fused));
         }
     }
 
@@ -108,7 +108,7 @@ std::size_t capacity_bytes_impl(LinearPolicy policy, std::int32_t min_tokens,
         --last_baseline;
     }
     if (last_baseline >= std::max(min_tokens, kFusedMaxTokens + 1)) {
-        maximum = std::max(maximum, baseline_workspace_bytes(last_baseline));
+        maximum = std::max(maximum, baseline_workspace_bytes<Geometry>(last_baseline));
     }
     return maximum;
 }

@@ -235,16 +235,43 @@ void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<voi
 
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
 
+    try {
+        body();
+    } catch (...) {
+        discard_capture(stream, nullptr, false);
+        throw;
+    }
+
+    cudaGraph_t graph = nullptr;
+
+    cudaError_t err = cudaStreamEndCapture(stream, &graph);
+    if (err != cudaSuccess) {
+        destroy_graph(graph);
+        CUDA_CHECK(err);
+    }
+
+    graph_ = graph;
+}
+
+void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<void()>& body,
+                                    const DecodeGraphPeerCapture& peer) {
+    if (peer.bridge == nullptr || peer.stream == nullptr) {
+        throw std::invalid_argument("dual-device capture requires a peer bridge and stream");
+    }
+
+    nvtx::ScopedRange capture_range(nvtx::Name::CudaGraphCapture, nvtx::Category::Graph);
+    reset();
+
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+
     bool peer_forked = false;
     try {
-        if (dual) {
-            fork_peer(stream, peer);
-            peer_forked = true;
-        }
+        fork_peer(stream, peer);
+        peer_forked = true;
         body();
-        if (dual) { join_peer(stream, peer); }
+        join_peer(stream, peer);
     } catch (...) {
-        discard_capture(stream, dual ? &peer : nullptr, peer_forked);
+        discard_capture(stream, &peer, peer_forked);
         throw;
     }
 

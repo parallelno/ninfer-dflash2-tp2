@@ -42,8 +42,14 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
         &launch_exact<Geometry, Output, kFp8FirstSmallT + static_cast<int>(Offsets)>...};
 }
 
-constexpr auto kLaunchers =
-    make_launchers(std::make_index_sequence<kFp8AttnInputLastSimtT - kFp8FirstSmallT + 1>{});
+constexpr auto kLaunchers = make_launchers<Fp8AttnInputGeometry, Fp8AttentionInputOutput>(
+    std::make_index_sequence<kFp8AttnInputLastSimtT - kFp8FirstSmallT + 1>{});
+
+constexpr auto kLaunchersShard =
+    make_launchers<Fp8AttnInputTp2ColumnGeometry,
+                   Fp8AttentionInputShardOutput<Fp8AttnInputTp2ColumnGeometry>>(
+        std::make_index_sequence<kFp8LinearSmallTMax<Fp8AttnInputTp2ColumnGeometry> -
+                                 kFp8FirstSmallT + 1>{});
 
 } // namespace
 

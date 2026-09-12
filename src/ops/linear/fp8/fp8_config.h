@@ -125,9 +125,17 @@ using Fp8MlpGateUpGeometry       = Fp8Geometry<34816, 5120>;
 using Fp8VocabularyGeometry      = Fp8Geometry<248320, 5120>;
 using Fp8Residual6144Geometry    = Fp8Geometry<5120, 6144>;
 using Fp8Residual17408Geometry   = Fp8Geometry<5120, 17408>;
+using Fp8VocabularyTp2ColumnGeometry = Fp8Geometry<124160, 5120>;
+using Fp8GdnInputTp2ColumnGeometry   = Fp8Geometry<8192, 5120>;
+using Fp8Residual6144Tp2RowGeometry  = Fp8Geometry<5120, 3072>;
+using Fp8Residual17408Tp2RowGeometry = Fp8Geometry<5120, 8704>;
+using Fp8MlpGateUpTp2ColumnGeometry  = Fp8Geometry<17408, 5120>;
+using Fp8AttnInputTp2ColumnGeometry  = Fp8Geometry<7168, 5120>;
 using Fp8Activation5120Geometry  = Fp8ActivationGeometry<5120>;
 using Fp8Activation6144Geometry  = Fp8ActivationGeometry<6144>;
 using Fp8Activation17408Geometry = Fp8ActivationGeometry<17408>;
+using Fp8Activation3072Geometry  = Fp8ActivationGeometry<3072>;
+using Fp8Activation8704Geometry  = Fp8ActivationGeometry<8704>;
 
 inline constexpr std::int32_t kFp8VocabularyFirstA16SmallTMmaT = 1;
 inline constexpr std::int32_t kFp8VocabularyLastA16SmallTMmaT  = 48;

@@ -120,7 +120,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .full_attention_layers     = TextConfig::full_attention_layers(),
                      .mtp_layers                = TextConfig::mtp_layers,
                      .capacity                  = plan.capacity,
-                     .kv_heads                  = TextConfig::kv_heads / tp,
+                     .kv_heads                  = TextConfig::kv_heads / plan.tp,
                      .attention_head_dim        = TextConfig::head_dim,
                      .kv_storage                = plan.kv_storage,
                      .enable_mtp                = plan.features.mtp(),
@@ -132,9 +132,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         .linear =
             {
                 .layers         = TextConfig::gdn_layers(),
-                .conv_channels  = TextConfig::convolution_dim,
+                .conv_channels  = TextConfig::convolution_dim / plan.tp,
                 .conv_width     = TextConfig::gdn_conv_state_width,
-                .value_heads    = TextConfig::gdn_value_heads,
+                .value_heads    = TextConfig::gdn_value_heads / plan.tp,
                 .value_head_dim = TextConfig::gdn_value_head_dim,
                 .key_head_dim   = TextConfig::gdn_key_head_dim,
                 .slot_count     = state_image_slots,
@@ -154,10 +154,6 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
     out.state_images = qwen3_6::plan_state_image_device_pool(builder, state_image_spec);
     if (plan.speculative_backend != SpeculativeBackend::None) {
-        if (tp != 1 && plan.speculative_backend != SpeculativeBackend::Mtp) {
-            throw std::invalid_argument(
-                "DFlash speculative decoding has no tensor-parallel path in this build");
-        }
         // ONE device's replay records, exactly like the decoder state above: the GDN verify round
         // records this device's own head/channel shard, and the registered
         // FoldGeometry<48, 8, 24, 5120> is the shape the peer's fold consumes. The RECORD
@@ -168,9 +164,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                          .layers          = TextConfig::gdn_layers(),
                          .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
                          .width           = static_cast<std::int32_t>(plan.draft_window + 1U),
-                         .conv_channels   = TextConfig::convolution_dim / tp,
-                         .qk_heads        = TextConfig::gdn_key_heads / tp,
-                         .value_heads     = TextConfig::gdn_value_heads / tp,
+                         .conv_channels   = TextConfig::convolution_dim / plan.tp,
+                         .qk_heads        = TextConfig::gdn_key_heads / plan.tp,
+                         .value_heads     = TextConfig::gdn_value_heads / plan.tp,
                          .key_dim         = TextConfig::gdn_key_head_dim,
                          .value_dim       = TextConfig::gdn_value_head_dim,
                      });
@@ -801,6 +797,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->causal_scoring      = inputs.causal_scoring;
     impl->device              = inputs.device;
+    impl->tp                  = inputs.tp;
     impl->context_cache       = inputs.context_cache;
     impl->kv_storage          = inputs.kv_storage;
     impl->persistent          = persistent_layout(*impl);
@@ -895,6 +892,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .use_cuda_graph      = options.use_cuda_graph,
         .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
         .device              = options.device,
+        .tp                  = options.tp,
         .context_cache       = options.context_cache,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);

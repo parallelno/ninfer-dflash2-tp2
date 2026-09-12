@@ -75,7 +75,7 @@ constexpr std::array<RouteSpec, 6> kK17408Routes{{
 constexpr std::array<RouteSpec, 4> kShardRoutes{{
     {{1, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
     {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
-    {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
+    {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C128},
     {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
 }};
 

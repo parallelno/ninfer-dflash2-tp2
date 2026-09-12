@@ -12,7 +12,11 @@
 #include <system_error>
 #include <utility>
 
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace ninfer::runtime {
 
@@ -23,7 +27,6 @@ const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults();
 namespace {
 
 using Json = nlohmann::json;
-using U128 = unsigned __int128;
 
 constexpr std::size_t direction_index(ContextTransferDirection direction) noexcept {
     return static_cast<std::size_t>(direction);
@@ -36,18 +39,33 @@ std::uint64_t saturating_add(std::uint64_t left, std::uint64_t right) noexcept {
 }
 
 std::uint64_t saturating_product(std::uint64_t left, std::uint64_t right) noexcept {
-    const U128 product = static_cast<U128>(left) * right;
-    return product > std::numeric_limits<std::uint64_t>::max()
-               ? std::numeric_limits<std::uint64_t>::max()
-               : static_cast<std::uint64_t>(product);
+    constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+    return left != 0 && right > maximum / left ? maximum : left * right;
 }
 
 std::uint64_t q32_product_ns(std::uint64_t coefficient, std::uint64_t units) noexcept {
     if (coefficient == 0 || units == 0) { return 0; }
-    const U128 product        = static_cast<U128>(coefficient) * units;
-    const U128 maximum_scaled = static_cast<U128>(std::numeric_limits<std::uint64_t>::max()) << 32U;
-    if (product >= maximum_scaled) { return std::numeric_limits<std::uint64_t>::max(); }
-    return static_cast<std::uint64_t>((product + kContextCostQ32One - 1U) >> 32U);
+
+    constexpr std::uint64_t limb_mask = 0xffffffffU;
+    const std::uint64_t coefficient_low  = coefficient & limb_mask;
+    const std::uint64_t coefficient_high = coefficient >> 32U;
+    const std::uint64_t units_low        = units & limb_mask;
+    const std::uint64_t units_high       = units >> 32U;
+
+    const std::uint64_t low_product = coefficient_low * units_low;
+    std::uint64_t middle = coefficient_high * units_low + (low_product >> 32U);
+    const std::uint64_t middle_low = middle & limb_mask;
+    const std::uint64_t middle_high = middle >> 32U;
+    middle = coefficient_low * units_high + middle_low;
+
+    const std::uint64_t product_high =
+        coefficient_high * units_high + middle_high + (middle >> 32U);
+    const std::uint64_t product_low = (middle << 32U) | (low_product & limb_mask);
+    if (product_high > limb_mask) { return std::numeric_limits<std::uint64_t>::max(); }
+
+    const std::uint64_t quotient = (product_high << 32U) | (product_low >> 32U);
+    if (quotient == std::numeric_limits<std::uint64_t>::max()) { return quotient; }
+    return quotient + static_cast<std::uint64_t>((product_low & limb_mask) != 0);
 }
 
 void require_object(const Json& value, std::string_view context) {
@@ -296,7 +314,12 @@ void write_document_atomic(const std::filesystem::path& path, const Json& docume
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
 
     std::filesystem::path temporary = path;
-    temporary += ".tmp." + std::to_string(static_cast<long long>(::getpid())) + "." +
+#ifdef _WIN32
+    const auto process_id = ::_getpid();
+#else
+    const auto process_id = ::getpid();
+#endif
+    temporary += ".tmp." + std::to_string(static_cast<long long>(process_id)) + "." +
                  std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     try {
         {

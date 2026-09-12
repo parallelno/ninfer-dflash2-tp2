@@ -103,11 +103,23 @@ void launch(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& 
 void nvfp4_linear_swiglu_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                      WorkspaceArena& workspace, cudaStream_t stream) {
     if (x.ne[1] <= M64N128::kBlockM) {
-        launch<M64N128>(x, weight, out, workspace, stream);
+                                        launch<Geometry, M64N128>(x, weight, out, workspace, stream);
     } else if (x.ne[1] <= M96N128::kBlockM) {
-        launch<M96N128>(x, weight, out, workspace, stream);
+                                        launch<Geometry, M96N128>(x, weight, out, workspace, stream);
     } else {
-        launch<M128N128>(x, weight, out, workspace, stream);
+                                        launch<Geometry, M128N128>(x, weight, out, workspace, stream);
+    }
+}
+
+void nvfp4_linear_swiglu_w4a4_launch_shard(const Tensor& x, const Weight& weight, Tensor& out,
+                                           WorkspaceArena& workspace, cudaStream_t stream) {
+    using Geometry = Nvfp4MlpGateUpTp2ColumnGeometry;
+    if (x.ne[1] <= M64N128::kBlockM) {
+        launch<Geometry, M64N128>(x, weight, out, workspace, stream);
+    } else if (x.ne[1] <= M96N128::kBlockM) {
+        launch<Geometry, M96N128>(x, weight, out, workspace, stream);
+    } else {
+        launch<Geometry, M128N128>(x, weight, out, workspace, stream);
     }
 }
 

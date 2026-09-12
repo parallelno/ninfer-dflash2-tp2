@@ -266,6 +266,29 @@ public:
         } catch (...) {}
     }
 
+    [[nodiscard]] std::vector<std::uint16_t> debug_last_round_logits_bf16() const {
+        std::scoped_lock lock(execution_mutex_);
+        const auto logits = instance_.program->last_round_logits_bf16();
+        return {logits.begin(), logits.end()};
+    }
+
+    void debug_enable_logit_capture(bool enabled) {
+        std::scoped_lock lock(execution_mutex_);
+        instance_.program->enable_logits_capture(enabled);
+    }
+
+    void debug_enable_peer_egress_check(bool enabled) {
+        std::scoped_lock lock(execution_mutex_);
+        instance_.program->enable_peer_egress_check(enabled);
+    }
+
+    [[nodiscard]] std::pair<std::uint64_t, std::uint64_t>
+    debug_peer_egress_check_counts() const {
+        std::scoped_lock lock(execution_mutex_);
+        return {instance_.program->peer_egress_check_rounds(),
+                instance_.program->peer_egress_check_mismatches()};
+    }
+
 private:
     enum class HostWorkClass : std::uint8_t {
         Decode,

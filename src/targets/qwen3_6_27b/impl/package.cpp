@@ -142,12 +142,18 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
 
 std::unique_ptr<Package::Program> Package::create_program(const LoadedModel& model,
                                                           SequencePlan&& plan,
-                                                          DeviceContext& device,
+                                                          ExecutionContext& execution,
                                                           const StartupObserver& startup_observer) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    return qwen3_6::create_program<detail::Variant>(model.impl_->data.runtime,
-                                                    model.impl_->weights_profile, std::move(plan),
-                                                    device, startup_observer);
+    const detail::LoadedModelData& data = model.impl_->data;
+    if (data.tp != execution.tp) {
+        throw std::invalid_argument("loaded model shard width does not match execution context");
+    }
+    const detail::RuntimeModelView* peer =
+        data.runtime_peer.has_value() ? &*data.runtime_peer : nullptr;
+    return qwen3_6::create_program<detail::Variant>(
+        data.runtime, peer, model.impl_->weights_profile, std::move(plan), execution,
+        startup_observer);
 }
 
 } // namespace ninfer::targets::qwen3_6_27b

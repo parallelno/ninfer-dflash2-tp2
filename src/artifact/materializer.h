@@ -55,7 +55,8 @@ public:
 
 private:
     friend MaterializedArtifact materialize(const Reader&, const MaterializationPlan&,
-                                            DeviceContext&, const StartupObserver*);
+                                            std::span<DeviceContext* const>,
+                                            const StartupObserver*);
 
     struct ObjectStorage {
         std::array<void*, kMaximumDevices> device{};
@@ -72,10 +73,11 @@ private:
 // two overloads below are the call forms.
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
                                  std::span<DeviceContext* const> devices,
-                                 LoadProgress* progress = nullptr);
+                                 const StartupObserver* startup_observer = nullptr);
 
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
-                                 ExecutionContext& execution, LoadProgress* progress = nullptr);
+                                 ExecutionContext& execution,
+                                 const StartupObserver* startup_observer = nullptr);
 
 // Single-device call form for the tp1 path; requires plan.device_count == 1.
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,

@@ -64,8 +64,21 @@ void launch_impl(const std::uint8_t* activation_codes, const std::uint8_t* activ
         activation_codes, activation_scales, weight_codes, weight_scales, tokens);
     constexpr int kPairN = M256N128S3::kBlockN / 2;
     const dim3 grid((Geometry::kOutputRows / 2) / kPairN, tokens / M256N128S3::kBlockM);
+#ifdef _WIN32
+    // MSVC cannot pass the alignas(128) descriptor block by value (C2719); copy it to a
+    // pool-backed device buffer and hand the kernel a pointer, freeing stream-ordered.
+    Nvfp4W4a4TmaDescriptors* device_descriptors = nullptr;
+    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&device_descriptors),
+                               sizeof(Nvfp4W4a4TmaDescriptors), stream));
+    CUDA_CHECK(cudaMemcpyAsync(device_descriptors, &descriptors, sizeof(descriptors),
+                               cudaMemcpyHostToDevice, stream));
+    nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>
+        <<<grid, M256N128S3::kThreads, kSharedBytes, stream>>>(device_descriptors, alpha, output);
+    CUDA_CHECK(cudaFreeAsync(device_descriptors, stream));
+#else
     nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>
         <<<grid, M256N128S3::kThreads, kSharedBytes, stream>>>(descriptors, alpha, output);
+#endif
     CUDA_CHECK(cudaGetLastError());
 }
 

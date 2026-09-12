@@ -157,6 +157,22 @@ ninfer_add_test(ninfer_qwen3_8_27b_dflash2_real_test
   SOURCES targets/qwen3_6_27b/test_engine_dflash2_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_8_27b_dflash2_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_8_27b_graph_tp2_test
+  SOURCES targets/qwen3_6_27b/test_graph_tp2.cpp
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen3_8_27b_graph_tp2_test PRIVATE ${NINFER_CUDART_TARGET})
+set_tests_properties(ninfer_qwen3_8_27b_graph_tp2_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+# Greedy tp1-vs-tp2 numerical parity harness. Source lives under tools/tp2/ because it is a
+# re-runnable host tool, not only a test; wired here as an opt-in ctest as well, on the same
+# env/device gate as its siblings above.
+ninfer_add_test(ninfer_qwen3_8_27b_tp2_parity_test
+  SOURCES ${PROJECT_SOURCE_DIR}/tools/tp2/parity.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine ninfer_product_prompt_input)
+# Match the engine's cudart flavor (static on WIN32): linking CUDA::cudart here pulls the DLL
+# import lib alongside ninfer_core's static one and fails with LNK2005 duplicate symbols.
+target_link_libraries(ninfer_qwen3_8_27b_tp2_parity_test PRIVATE ${NINFER_CUDART_TARGET})
+set_tests_properties(ninfer_qwen3_8_27b_tp2_parity_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 5400)
 ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
   SOURCES targets/qwen3_6_27b/test_load_plan.cpp
   NEEDS_SOURCE_DIR

@@ -924,9 +924,34 @@ private:
                            ? item.estimated_total_ns - parent.estimated_total_ns
                            : 0;
             };
-            const __uint128_t left  = static_cast<__uint128_t>(delta(cost)) * b;
-            const __uint128_t right = static_cast<__uint128_t>(delta(prior)) * a;
-            if (left != right) { return left < right; }
+            auto compare_fractions = [](std::uint64_t left_numerator,
+                                        std::uint64_t left_denominator,
+                                        std::uint64_t right_numerator,
+                                        std::uint64_t right_denominator) noexcept {
+                bool reversed = false;
+                for (;;) {
+                    const auto left_quotient  = left_numerator / left_denominator;
+                    const auto right_quotient = right_numerator / right_denominator;
+                    if (left_quotient != right_quotient) {
+                        const bool less = left_quotient < right_quotient;
+                        return (less != reversed) ? -1 : 1;
+                    }
+                    const auto left_remainder  = left_numerator % left_denominator;
+                    const auto right_remainder = right_numerator % right_denominator;
+                    if (left_remainder == 0 || right_remainder == 0) {
+                        if (left_remainder == right_remainder) { return 0; }
+                        const bool less = left_remainder == 0;
+                        return (less != reversed) ? -1 : 1;
+                    }
+                    left_numerator   = left_denominator;
+                    left_denominator = left_remainder;
+                    right_numerator  = right_denominator;
+                    right_denominator = right_remainder;
+                    reversed = !reversed;
+                }
+            };
+            const int comparison = compare_fractions(delta(cost), a, delta(prior), b);
+            if (comparison != 0) { return comparison < 0; }
         }
         return cost.key() < prior.key();
     }

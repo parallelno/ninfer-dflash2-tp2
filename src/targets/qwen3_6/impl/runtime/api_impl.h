@@ -18,9 +18,13 @@ SequencePlan<Variant>::SequencePlan(
     : impl_(std::move(impl)) {}
 
 template <>
-SequencePlan<Variant>::SequencePlan(SequencePlan&&) noexcept = default;
+SequencePlan<Variant>::SequencePlan(SequencePlan&& other) noexcept
+    : impl_(std::move(other.impl_)) {}
 template <>
-SequencePlan<Variant>& SequencePlan<Variant>::operator=(SequencePlan&&) noexcept = default;
+SequencePlan<Variant>& SequencePlan<Variant>::operator=(SequencePlan&& other) noexcept {
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 template <>
 SequencePlan<Variant>::~SequencePlan() = default;
 
@@ -55,9 +59,13 @@ SequencePlanner<Variant>::SequencePlanner(
     : impl_(std::move(impl)) {}
 
 template <>
-SequencePlanner<Variant>::SequencePlanner(SequencePlanner&&) noexcept = default;
+SequencePlanner<Variant>::SequencePlanner(SequencePlanner&& other) noexcept
+    : impl_(std::move(other.impl_)) {}
 template <>
-SequencePlanner<Variant>& SequencePlanner<Variant>::operator=(SequencePlanner&&) noexcept = default;
+SequencePlanner<Variant>& SequencePlanner<Variant>::operator=(SequencePlanner&& other) noexcept {
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 template <>
 SequencePlanner<Variant>::~SequencePlanner() = default;
 
@@ -80,9 +88,13 @@ RequestBasePlan<Variant>::RequestBasePlan(
     : impl_(std::move(impl)) {}
 
 template <>
-RequestBasePlan<Variant>::RequestBasePlan(RequestBasePlan&&) noexcept = default;
+RequestBasePlan<Variant>::RequestBasePlan(RequestBasePlan&& other) noexcept
+    : impl_(std::move(other.impl_)) {}
 template <>
-RequestBasePlan<Variant>& RequestBasePlan<Variant>::operator=(RequestBasePlan&&) noexcept = default;
+RequestBasePlan<Variant>& RequestBasePlan<Variant>::operator=(RequestBasePlan&& other) noexcept {
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 template <>
 RequestBasePlan<Variant>::~RequestBasePlan() = default;
 
@@ -631,16 +643,17 @@ SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
 
 template <>
 std::unique_ptr<Program<Variant>>
-create_program<Variant>(const Variant::ModelView& model, Variant::WeightsProfile weights_profile,
-                        SequencePlan<Variant>&& plan, DeviceContext& device,
+create_program<Variant>(const Variant::ModelView& model, const Variant::ModelView* peer_model,
+                        Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
+                        ExecutionContext& execution,
                         const StartupObserver& startup_observer) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
     if (plan.impl_->weights_profile != weights_profile) {
         throw std::invalid_argument(
             "loaded model weights profile does not match the sequence plan");
     }
-    auto impl = std::make_unique<detail::ProgramImpl<Variant>>(model, *plan.impl_, device,
-                                                               startup_observer);
+    auto impl = std::make_unique<detail::ProgramImpl<Variant>>(
+        model, peer_model, *plan.impl_, execution, startup_observer);
     plan.impl_.reset();
     return std::unique_ptr<Program<Variant>>(new Program<Variant>(std::move(impl)));
 }

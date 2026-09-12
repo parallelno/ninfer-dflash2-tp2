@@ -97,6 +97,18 @@ public:
 
     [[nodiscard]] RuntimeStats runtime_stats() const noexcept { return {}; }
 
+    [[nodiscard]] std::vector<std::uint16_t> debug_last_round_logits_bf16() const { return {}; }
+    void debug_enable_logit_capture(bool) {
+        throw std::logic_error("logit capture is unavailable for causal scoring");
+    }
+    void debug_enable_peer_egress_check(bool) {
+        throw std::logic_error("peer egress checks are unavailable for causal scoring");
+    }
+    [[nodiscard]] std::pair<std::uint64_t, std::uint64_t>
+    debug_peer_egress_check_counts() const {
+        return {};
+    }
+
     [[nodiscard]] bool is_available() const {
         std::lock_guard lock(queue_mutex_);
         return !stopping_;

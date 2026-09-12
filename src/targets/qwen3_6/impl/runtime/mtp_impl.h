@@ -28,7 +28,8 @@ struct MtpRoundView {
     Tensor target_rope;
     Tensor text_rows;
     Tensor mtp_rows;
-    Tensor lanes;
+    Tensor state_sources;
+    Tensor state_destinations;
     Tensor rope_deltas;
     Tensor verify_ids;
     Tensor target_positions;
@@ -63,7 +64,8 @@ MtpRoundView slice_mtp_frame(qwen3_6::MtpDecodeState& frame, std::int32_t batch_
     out.target_rope       = frame.target_rope_positions.slice(1, 0, batch_size);
     out.text_rows         = frame.text_kv_table_rows.slice(0, 0, batch_size);
     out.mtp_rows          = frame.mtp_kv_table_rows.slice(0, 0, batch_size);
-    out.lanes             = frame.lanes.slice(0, 0, batch_size);
+    out.state_sources     = frame.state_source_slots.slice(0, 0, batch_size);
+    out.state_destinations = frame.state_destination_slots.slice(0, 0, batch_size);
     out.rope_deltas       = frame.rope_deltas.slice(0, 0, batch_size);
     out.verify_ids        = frame.verify_ids.slice(1, 0, batch_size);
     out.target_positions  = frame.target_positions.slice(1, 0, batch_size);
@@ -95,7 +97,8 @@ TargetVerifyFrameView verify_view(const MtpRoundView& v, const GdnReplayRecords*
         .rope_positions  = v.target_rope,
         .valid_columns   = v.target_valid,
         .kv_table_rows   = v.text_rows,
-        .lanes           = v.lanes,
+        .state_source_slots      = v.state_sources,
+        .state_destination_slots = v.state_destinations,
         .target_hidden   = v.target_hidden,
         .target_logits   = v.target_logits,
         .target_tokens   = v.target_tokens,
@@ -180,6 +183,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     }
 }
 
+
 auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                            MtpCausalAttentionEnvelopes envelopes) {
     return [&state, batch_size, k, envelopes] {
@@ -221,10 +225,11 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                        tp->device->stream));
         }
 
-        TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
-                         state.execution.linear_attention, state.execution.io,
+        TextContext card(state.execution.device, state.execution.model, state.execution.work,
+                 state.execution.rope_frequency, {}, state.execution.linear_attention,
+                 state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
-                         &state.text_cache, &state.mtp_cache);
+                 &state.text_cache, &state.mtp_cache, tp ? &*tp : nullptr);
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers          = frame.base_frontiers.slice(0, 0, batch_size);
         Tensor budgets            = frame.remaining_budgets.slice(0, 0, batch_size);
@@ -259,11 +264,23 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers, current_extents,
                                                verify_ids, target_positions,
                                                state.execution.device.stream);
+        std::optional<MtpRoundView> peer_round;
+        if (tp) {
+            if (!tp->io->mtp_decode.has_value()) {
+                throw std::logic_error("tensor-parallel MTP decode requires a peer frame");
+            }
+            peer_round.emplace(slice_mtp_frame(*tp->io->mtp_decode, batch_size));
+            const CurrentDevice restore;
+            CUDA_CHECK(cudaSetDevice(tp->device->device));
+            ops::speculative_prepare_verify_inputs(
+                peer_round->anchors, peer_round->current_drafts, peer_round->frontiers,
+                peer_round->current_extents, peer_round->verify_ids,
+                peer_round->target_positions, tp->device->stream);
+        }
         {
             nvtx::ScopedRange target_range(nvtx::Name::DecodeMtpTarget, nvtx::Category::Mtp,
                                            static_cast<std::uint64_t>(width) * batch_size);
-            target_verify_accept(state.execution, state.continuation_hidden_store, card,
-                                 TargetVerifyFrameView{
+            TargetVerifyFrameView local_verify{
                                      .ids                     = verify_ids,
                                      .cache_positions         = target_positions,
                                      .rope_positions          = target_rope,
@@ -284,8 +301,16 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                      .selected_hidden         = selected_hidden,
                                      .replay_records          = state.execution.replay_records,
                                      .sampling                = frame.sampling,
-                                 },
-                                 envelopes.target_verify);
+                                 };
+            if (peer_round) {
+                target_verify_accept(state.execution, state.continuation_hidden_store, card,
+                                     local_verify,
+                                     verify_view(*peer_round, tp->replay_records),
+                                     envelopes.target_verify);
+            } else {
+                target_verify_accept(state.execution, state.continuation_hidden_store, card,
+                                     local_verify, envelopes.target_verify);
+            }
         }
 
         {

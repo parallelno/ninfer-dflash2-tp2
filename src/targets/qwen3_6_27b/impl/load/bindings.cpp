@@ -612,7 +612,8 @@ ShardMapping shard_mapping(std::string_view object, int tp, const TextConfig& co
     if (ends("token_embedding") || ends("final_norm") || ends("input_norm") ||
         ends("post_attention_norm") || ends("attention/query_norm") ||
         ends("attention/key_norm") || ends("gdn/norm") || ends("embedding_norm") ||
-        ends("hidden_norm") || ends("draft_head_token_ids")) {
+        ends("hidden_norm") || ends("draft_head_token_ids") ||
+        object.starts_with("dflash2/")) {
         return {};
     }
 
@@ -1140,48 +1141,52 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
         const DFlash2Plan& source = *plan.dflash2;
         auto& dflash2             = runtime.dflash.emplace();
         dflash2.feature_projection =
-            materialized_weight(backing, source.feature_projection, 5120, 25600);
+            materialized_weight(backing, source.feature_projection, 5120, 25600, device);
         dflash2.context_norm = artifact::materialized_tensor(backing, source.context_norm,
-                                                             NumericFormat::BF16, {5120});
+                                                             NumericFormat::BF16, {5120}, device);
         for (std::size_t layer = 0; layer < dflash2.layers.size(); ++layer) {
             const DFlash2LayerPlan& layer_source = source.layers[layer];
             qwen3_6::DFlash2LayerWeights& target = dflash2.layers[layer];
             target.input_norm = artifact::materialized_tensor(backing, layer_source.input_norm,
-                                                              NumericFormat::BF16, {5120});
+                                                              NumericFormat::BF16, {5120}, device);
             target.attention_conv.base_kernel =
                 artifact::materialized_tensor(backing, layer_source.attention_conv.base_kernel,
-                                              NumericFormat::BF16, {5120, 2, 2});
+                                              NumericFormat::BF16, {5120, 2, 2}, device);
             target.attention_conv.kernel_projection = materialized_weight(
-                backing, layer_source.attention_conv.kernel_projection, 1280, 5120);
+                backing, layer_source.attention_conv.kernel_projection, 1280, 5120, device);
             target.query_key_value =
-                materialized_weight(backing, layer_source.query_key_value, 6144, 5120);
+                materialized_weight(backing, layer_source.query_key_value, 6144, 5120, device);
             target.context_key   = row_view(target.query_key_value, 4096, 1024);
             target.context_value = row_view(target.query_key_value, 5120, 1024);
             target.query_norm    = artifact::materialized_tensor(backing, layer_source.query_norm,
-                                                                 NumericFormat::BF16, {128});
+                                                                 NumericFormat::BF16, {128}, device);
             target.key_norm      = artifact::materialized_tensor(backing, layer_source.key_norm,
-                                                                 NumericFormat::BF16, {128});
+                                                                 NumericFormat::BF16, {128}, device);
             target.attention_output =
-                materialized_weight(backing, layer_source.attention_output, 5120, 4096);
+                materialized_weight(backing, layer_source.attention_output, 5120, 4096, device);
             target.post_attention_norm = artifact::materialized_tensor(
-                backing, layer_source.post_attention_norm, NumericFormat::BF16, {5120});
+                backing, layer_source.post_attention_norm, NumericFormat::BF16, {5120}, device);
             target.mlp_conv.base_kernel = artifact::materialized_tensor(
-                backing, layer_source.mlp_conv.base_kernel, NumericFormat::BF16, {5120, 2, 2});
+                backing, layer_source.mlp_conv.base_kernel, NumericFormat::BF16, {5120, 2, 2},
+                device);
             target.mlp_conv.kernel_projection =
-                materialized_weight(backing, layer_source.mlp_conv.kernel_projection, 1280, 5120);
-            target.gate_up = materialized_weight(backing, layer_source.gate_up, 34816, 5120);
-            target.down    = materialized_weight(backing, layer_source.down, 5120, 17408);
+                materialized_weight(backing, layer_source.mlp_conv.kernel_projection, 1280, 5120,
+                                    device);
+            target.gate_up =
+                materialized_weight(backing, layer_source.gate_up, 34816, 5120, device);
+            target.down = materialized_weight(backing, layer_source.down, 5120, 17408, device);
         }
-        dflash2.final_norm =
-            artifact::materialized_tensor(backing, source.final_norm, NumericFormat::BF16, {5120});
+        dflash2.final_norm = artifact::materialized_tensor(backing, source.final_norm,
+                                                           NumericFormat::BF16, {5120}, device);
         dflash2.candidate_selector.hidden_projection =
-            materialized_weight(backing, source.candidate_selector.hidden_projection, 256, 5120);
+            materialized_weight(backing, source.candidate_selector.hidden_projection, 256, 5120,
+                                device);
         dflash2.candidate_selector.predecessor_codebook =
             artifact::materialized_tensor(backing, source.candidate_selector.predecessor_codebook,
-                                          NumericFormat::BF16, {256, 248320});
+                                          NumericFormat::BF16, {256, 248320}, device);
         dflash2.candidate_selector.successor_codebook =
             artifact::materialized_tensor(backing, source.candidate_selector.successor_codebook,
-                                          NumericFormat::BF16, {256, 248320});
+                                          NumericFormat::BF16, {256, 248320}, device);
     }
 
     if (plan.features.vision) {

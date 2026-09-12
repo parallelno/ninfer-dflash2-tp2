@@ -6,6 +6,8 @@
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/allreduce.h"
+#include "ninfer/ops/peer_mailbox.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
@@ -280,7 +282,10 @@ AdmissionCandidate<NINFER_QWEN36_VARIANT>::AdmissionCandidate(AdmissionCandidate
 
 template <>
 AdmissionCandidate<NINFER_QWEN36_VARIANT>&
-AdmissionCandidate<NINFER_QWEN36_VARIANT>::operator=(AdmissionCandidate&&) noexcept = default;
+AdmissionCandidate<NINFER_QWEN36_VARIANT>::operator=(AdmissionCandidate&& other) noexcept {
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 
 template <>
 AdmissionCandidate<NINFER_QWEN36_VARIANT>::~AdmissionCandidate() = default;
@@ -296,8 +301,11 @@ CapturePressureCandidate<NINFER_QWEN36_VARIANT>::CapturePressureCandidate(
 
 template <>
 CapturePressureCandidate<NINFER_QWEN36_VARIANT>&
-CapturePressureCandidate<NINFER_QWEN36_VARIANT>::operator=(CapturePressureCandidate&&) noexcept =
-    default;
+CapturePressureCandidate<NINFER_QWEN36_VARIANT>::operator=(
+    CapturePressureCandidate&& other) noexcept {
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 
 template <>
 CapturePressureCandidate<NINFER_QWEN36_VARIANT>::~CapturePressureCandidate() = default;
@@ -404,6 +412,8 @@ struct DecodeGraphFamily {
 // output, sampling, and round-control state.
 struct SequenceState {
     std::optional<SequenceKVBundle> kv;
+    std::optional<KVExecutionRowLease> text_kv_peer_row;
+    std::optional<KVExecutionRowLease> backend_kv_peer_row;
     ActiveStateBinding state;
     std::optional<StateImageHandle> rewrite_state;
     std::optional<StateImageHandle> reserved_state;
@@ -503,10 +513,12 @@ struct PeerRuntime {
     DeviceArena workspace_storage;
     WorkspaceArena work;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
+    std::unique_ptr<qwen3_6::StateImageDevicePool> state_images;
     // Rank 1's own GDN replay records: the speculative verify round records this device's own
     // head/channel shard and folds it here, so the two devices commit the same accepted prefix
     // from records neither ever exchanges.
     std::optional<GdnReplayRecords> replay_records;
+    std::optional<ops::GdnReplayFoldPlan> replay_fold;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
     // Rank 1's OWN penalty counters. `ops::SamplingConfig::token_counts` is a raw device pointer,
@@ -547,8 +559,9 @@ public:
         qwen3_6::ContinuationSummary continuation_summary;
     };
 
-    ProgramImplCore(const LoadedModelData& model, const SequencePlanImpl& plan,
-                    DeviceContext& device, const StartupObserver& startup_observer);
+    ProgramImplCore(const LoadedModelData& model, const LoadedModelData* peer_model,
+                    const SequencePlanImpl& plan, ExecutionContext& execution,
+                    const StartupObserver& startup_observer);
     ~ProgramImplCore() noexcept;
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
@@ -668,9 +681,9 @@ public:
     const bool use_cuda_graph;
     const bool causal_scoring;
     const std::size_t kv_payload_bytes;
-    const std::size_t gdn_state_bytes;
     const std::size_t graph_allowance_bytes;
     const WorkspacePlan workspace_plan;
+    std::size_t graph_node_count = 0;
 
     DeviceArena persistent;
     DeviceArena workspace_storage;
@@ -694,6 +707,10 @@ public:
     const double yarn_mscale;
     std::optional<PeerRuntime> peer;
     std::optional<ops::PeerEvents> peer_events;
+    // Created once at tp2 when graphs are on: the pinned host slab the captured collectives
+    // exchange through (see ops::PeerMailbox). The staged, event-ordered path in
+    // ops::allreduce_sum stays the only path for eager execution and oversized payloads.
+    std::optional<ops::PeerMailbox> peer_mailbox;
     // Created once at tp2 when graphs are on; forks rank 1's stream into rank 0's capture.
     std::optional<DecodeGraphPeerBridge> graph_bridge;
     std::optional<schedule::TpPeerCore> peer_core;
@@ -775,6 +792,10 @@ public:
     std::optional<PinnedHostBuffer> dflash_host;
     qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
+    // Stable rank-1 ingress address used by eager execution and baked into captured graphs.
+    // DFlash proposal and acceptance stay on rank 0, so rank 1's sampling pointers are null.
+    std::optional<PinnedHostBuffer> dflash_peer_host;
+    qwen3_6::DFlashDecodeIngress* dflash_peer_host_ingress = nullptr;
 
     std::size_t workspace_logical_peak_bytes = 0;
     std::size_t vision_handoff_peak_bytes    = 0;
@@ -1316,6 +1337,9 @@ private:
     // Mirrors `ordinary_host_ingress` into `ordinary_peer_host_ingress` with every row's counter
     // pointer nulled. No-op at tp1 or without an ordinary frame.
     void publish_peer_ordinary_ingress();
+    // Mirrors `dflash_host_ingress` into the stable peer record with rank-0 device pointers
+    // removed. No-op at tp1 or without a DFlash frame.
+    void publish_peer_dflash_ingress();
     // Debug-only: reads rank 1's MTP egress back and compares it, field for field, with rank 0's.
     // No-op unless the check is enabled and a peer exists.
     void check_peer_mtp_egress(std::size_t rows);
@@ -1325,6 +1349,7 @@ private:
     void set_peer_i32(Tensor& tensor, std::int32_t value);
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();
+    void copy_round_logits();
     void
     commit_generated_prefix_identity(SequenceState& sequence, std::uint32_t base_ledger_frontier,
                                      std::span<const TokenId> accepted_tokens,

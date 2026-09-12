@@ -1,5 +1,12 @@
 #pragma once
 
+#ifdef _WIN32
+// CUDA 12.8's nvtx3/nvtxDetail/nvtxInit.h calls _wgetenv on the Windows path without
+// including <stdlib.h>; the declaration must come from the including TU or the file
+// fails to compile under MSVC. Later toolkits include it themselves.
+#include <stdlib.h>
+#endif
+
 #include <nvtx3/nvToolsExt.h>
 
 #include <array>

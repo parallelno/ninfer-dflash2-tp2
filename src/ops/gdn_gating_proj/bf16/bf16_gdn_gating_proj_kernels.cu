@@ -476,6 +476,74 @@ void bf16_gdn_gating_proj_small_t_split10_launch(const Tensor& x, const Weight& 
     CUDA_CHECK(cudaGetLastError());
 }
 
+void bf16_gdn_gating_proj_gemv_shard_launch(const Tensor& x, const Weight& a_weight,
+                                            const Weight& b_weight, const Tensor& A_log,
+                                            const Tensor& dt_bias, Tensor& g, Tensor& beta,
+                                            cudaStream_t stream) {
+    require_shard_shape(a_weight, "a_weight");
+    require_shard_shape(b_weight, "b_weight");
+    bf16_gdn_gating_proj_gemv_kernel<kShardN><<<2 * kShardN, kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const __nv_bfloat16*>(a_weight.qdata),
+        static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<const float*>(A_log.data),
+        static_cast<const float*>(dt_bias.data), static_cast<float*>(g.data),
+        static_cast<float*>(beta.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void bf16_gdn_gating_proj_small_t_split10_shard_launch(
+    const Tensor& x, const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
+    const Tensor& dt_bias, void* workspace, std::size_t workspace_bytes, Tensor& g, Tensor& beta,
+    cudaStream_t stream) {
+    require_shard_shape(a_weight, "a_weight");
+    require_shard_shape(b_weight, "b_weight");
+    constexpr int kShardLogicalRows = 2 * kShardN;
+    const std::int32_t t            = x.ne[1];
+    const std::size_t required      = static_cast<std::size_t>(kSmallTSplits) *
+                                 static_cast<std::size_t>(t) *
+                                 static_cast<std::size_t>(kShardLogicalRows) * sizeof(float);
+    if (workspace == nullptr || workspace_bytes < required) {
+        throw std::invalid_argument(
+            "gdn_gating_proj column-parallel: small-T workspace is too small");
+    }
+    dim3 partial_grid(div_up(kShardLogicalRows, kSmallTRowsPerBlock), kSmallTSplits,
+                      div_up(t, kSmallTMax));
+    bf16_gdn_gating_proj_small_t_partial_kernel<kSmallTMax, kSmallTKSlice, kSmallTRowsPerBlock,
+                                                kShardN>
+        <<<partial_grid, kSmallTThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(a_weight.qdata),
+            static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<float*>(workspace), t);
+    constexpr int kReduceThreads = 128;
+    const int reduce_blocks      = div_up(kShardN * t, kReduceThreads);
+    bf16_gdn_gating_proj_small_t_reduce_kernel<kShardN>
+        <<<reduce_blocks, kReduceThreads, 0, stream>>>(
+            static_cast<const float*>(workspace), static_cast<const float*>(A_log.data),
+            static_cast<const float*>(dt_bias.data), static_cast<float*>(g.data),
+            static_cast<float*>(beta.data), t);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void bf16_gdn_gating_dispatch_shard(const Tensor& x, const Weight& a_weight,
+                                    const Weight& b_weight, const Tensor& A_log,
+                                    const Tensor& dt_bias, void* workspace,
+                                    std::size_t workspace_bytes, Tensor& g, Tensor& beta,
+                                    cudaStream_t stream) {
+    if (x.ne[1] == 1) {
+        bf16_gdn_gating_proj_gemv_shard_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
+                                               stream);
+        return;
+    }
+    bf16_gdn_gating_proj_small_t_split10_shard_launch(
+        x, a_weight, b_weight, A_log, dt_bias, workspace, workspace_bytes, g, beta, stream);
+}
+
+std::size_t bf16_gdn_gating_shard_workspace_bytes(std::int32_t tokens) {
+    if (tokens <= 1) { return 0; }
+    return static_cast<std::size_t>(kSmallTSplits) * static_cast<std::size_t>(tokens) *
+           static_cast<std::size_t>(2 * kShardN) * sizeof(float);
+}
+
 bool bf16_gdn_gating_proj_mma_split8_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
                                             const Weight& a_weight, const Weight& b_weight,
                                             const Tensor& A_log, const Tensor& dt_bias,

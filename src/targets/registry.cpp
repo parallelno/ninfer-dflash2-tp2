@@ -21,6 +21,19 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+class ScopedCudaDevice {
+public:
+    explicit ScopedCudaDevice(int device) {
+        CUDA_CHECK(cudaGetDevice(&previous_));
+        CUDA_CHECK(cudaSetDevice(device));
+    }
+
+    ~ScopedCudaDevice() { (void)cudaSetDevice(previous_); }
+
+private:
+    int previous_ = 0;
+};
+
 void validate_options(const EngineOptions& options) {
     if (options.artifact_path.empty()) {
         throw std::invalid_argument("Engine artifact_path must not be empty");
@@ -65,7 +78,8 @@ void validate_options(const EngineOptions& options) {
     }
 }
 
-std::size_t runtime_bytes_after_planned_weights(std::uint64_t weight_bytes) {
+std::size_t runtime_bytes_after_planned_weights(int device, std::uint64_t weight_bytes) {
+    const ScopedCudaDevice scope(device);
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
@@ -80,7 +94,7 @@ std::size_t runtime_bytes_after_planned_weights(std::uint64_t weight_bytes) {
 }
 
 std::size_t current_free_device_bytes(int device) {
-    const ScopedDevice scope(device);
+    const ScopedCudaDevice scope(device);
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
@@ -88,7 +102,7 @@ std::size_t current_free_device_bytes(int device) {
 }
 
 std::size_t current_total_device_bytes(int device) {
-    const ScopedDevice scope(device);
+    const ScopedCudaDevice scope(device);
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
@@ -100,6 +114,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
                                        artifact::Reader& reader, Clock::time_point load_start,
                                        std::string_view target_key) {
     StartupPhaseScope target_plan_phase(options.startup_observer, StartupPhase::TargetPlan);
+    DeviceContext& device                         = execution.primary();
+    const int tp                                  = execution.tp;
     const auto& identity                          = reader.identity();
     const auto weights_profile                    = Target::resolve_weights(identity);
     const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(identity.model_id);
@@ -119,12 +135,19 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
     // serves both devices and the resolver only has to pick the bottleneck device's budget.
     auto sequence_planner = Target::make_sequence_planner(device, options, weights_profile);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
-    const std::size_t preflight_runtime_bytes =
-        runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes);
-    (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime_bytes);
+    std::vector<std::size_t> preflight_runtime_bytes;
+    preflight_runtime_bytes.reserve(static_cast<std::size_t>(tp));
+    for (int rank = 0; rank < tp; ++rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        preflight_runtime_bytes.push_back(runtime_bytes_after_planned_weights(
+            execution.dev[slot]->device,
+            load_plan.materialization().device_capacity_bytes[slot]));
+    }
+    (void)runtime::resolve_kv_capacity_symmetric(options.kv_capacity, curve,
+                                                  preflight_runtime_bytes);
     target_plan_phase.complete();
 
-    auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
+    auto materialized = artifact::materialize(reader, load_plan.materialization(), execution,
                                               &options.startup_observer);
     const artifact::MaterializationStats stats = materialized.stats();
 
@@ -155,10 +178,13 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
     StartupPhaseScope program_phase(options.startup_observer, StartupPhase::ProgramInitialize);
     auto instance =
         std::make_unique<Instance>(std::move(loaded), capacity_resolution, std::move(sequence_plan),
-                                   device, options.startup_observer);
-    device.synchronize();
+                                   execution, options.startup_observer);
+    for (int rank = 0; rank < tp; ++rank) {
+        execution.dev[static_cast<std::size_t>(rank)]->synchronize();
+    }
     program_phase.complete();
-    instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
+    instance->kv_capacity_resolution.available_after_startup_bytes =
+        current_free_device_bytes(device.device);
 
     LoadSummary summary;
     // Rotary regime, as the target runtime resolved it. `effective_max_context` and `yarn_mscale`
@@ -219,11 +245,11 @@ LoadedQwen3_6_27B::~LoadedQwen3_6_27B() = default;
 Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stable_loaded,
                                          runtime::KvCapacityResolution resolution,
                                          Qwen3_6_27B::SequencePlan sequence_plan,
-                                         DeviceContext& device,
+                                         ExecutionContext& execution,
                                          const StartupObserver& startup_observer)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       capacity(sequence_plan.capacity()),
-      program(Qwen3_6_27B::create_program(*loaded->model, std::move(sequence_plan), device,
+    program(Qwen3_6_27B::create_program(*loaded->model, std::move(sequence_plan), execution,
                                           startup_observer)) {}
 
 Qwen3_6_27BInstance::~Qwen3_6_27BInstance() = default;
@@ -237,11 +263,11 @@ LoadedQwen3_6_35BA3B::~LoadedQwen3_6_35BA3B() = default;
 Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35BA3B> stable_loaded,
                                                runtime::KvCapacityResolution resolution,
                                                Qwen3_6_35BA3B::SequencePlan sequence_plan,
-                                               DeviceContext& device,
+                                               ExecutionContext& execution,
                                                const StartupObserver& startup_observer)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       capacity(sequence_plan.capacity()),
-      program(Qwen3_6_35BA3B::create_program(*loaded->model, std::move(sequence_plan), device,
+    program(Qwen3_6_35BA3B::create_program(*loaded->model, std::move(sequence_plan), execution,
                                              startup_observer)) {}
 
 Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;

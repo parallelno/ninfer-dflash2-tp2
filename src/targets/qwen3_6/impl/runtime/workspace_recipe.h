@@ -119,8 +119,8 @@ GdnProjectionRoots gdn_projection(Allocator& allocator, std::int32_t tokens, std
 }
 
 template <class Config, class Allocator>
-Tensor gdn_prefill_conv(Allocator& allocator, std::int32_t tokens) {
-    return matrix(allocator, DType::BF16, Config::convolution_dim, tokens);
+Tensor gdn_prefill_conv(Allocator& allocator, std::int32_t tokens, std::int32_t tp = 1) {
+    return matrix(allocator, DType::BF16, Config::convolution_dim / tp, tokens);
 }
 
 template <class Config, class Allocator>

@@ -66,6 +66,26 @@ static_assert((1024 % TmaM256N128::kBlockN) == 0);
 static_assert((6144 % TmaM256N128::kBlockN) == 0);
 static_assert((3072 % TmaM256N128::kBlockN) == 0);
 
+// On Windows/MSVC the 512-byte alignas(128) descriptor block cannot be passed by value
+// (C2719), so it is copied to a pool-backed device buffer and the kernel receives a pointer;
+// the free is stream-ordered. On other hosts the by-value __grid_constant__ parameter is used.
+struct Nvfp4TmaDescriptorBlock {
+    Nvfp4W4a4TmaDescriptors* device = nullptr;
+
+    explicit Nvfp4TmaDescriptorBlock(cudaStream_t stream) {
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&device),
+                                   sizeof(Nvfp4W4a4TmaDescriptors), stream));
+    }
+
+    Nvfp4TmaDescriptorBlock(const Nvfp4TmaDescriptorBlock&)            = delete;
+    Nvfp4TmaDescriptorBlock& operator=(const Nvfp4TmaDescriptorBlock&) = delete;
+
+    ~Nvfp4TmaDescriptorBlock() {
+        if (device == nullptr) { return; }
+        CUDA_CHECK(cudaFreeAsync(device, nullptr));
+    }
+};
+
 template <class Geometry, class Schedule, class Epilogue, class Output>
 void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activation_scales,
                 const std::uint8_t* weight_codes, const std::uint8_t* weight_scales,
@@ -80,8 +100,16 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
                                 static_cast<int>(kSharedBytes));
 
     const dim3 grid(Geometry::kOutputRows / Schedule::kBlockN, tokens / Schedule::kBlockM);
+#ifdef _WIN32
+    Nvfp4TmaDescriptorBlock block(stream);
+    CUDA_CHECK(cudaMemcpyAsync(block.device, &descriptors, sizeof(descriptors),
+                               cudaMemcpyHostToDevice, stream));
+    nvfp4_w4a4_tma_kernel<Geometry, Schedule>
+        <<<grid, Schedule::kThreads, kSharedBytes, stream>>>(block.device, alpha, epilogue, output);
+#else
     nvfp4_w4a4_tma_kernel<Geometry, Schedule>
         <<<grid, Schedule::kThreads, kSharedBytes, stream>>>(descriptors, alpha, epilogue, output);
+#endif
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -92,6 +92,7 @@ struct SequencePlanningInputs {
     bool use_cuda_graph = true;
     bool causal_scoring = false;
     int device          = 0;
+    int tp              = 1;
     ContextCacheOptions context_cache;
 };
 
@@ -120,6 +121,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     bool use_cuda_graph = true;
     bool causal_scoring = false;
     int device          = 0;
+    int tp              = 1;
     ContextCacheOptions context_cache;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;

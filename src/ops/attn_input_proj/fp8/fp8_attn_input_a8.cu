@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_output.cuh"
 #include "ops/linear/fp8/fp8_a8_mma.cuh"
+#include "ops/linear/fp8/fp8_a8_schedule.cuh"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_output.cuh"
 
@@ -13,9 +14,7 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using Geometry = Fp8AttnInputGeometry;
-
-template <class Schedule, bool FullTokens>
+template <class Geometry, class Output, class Schedule, bool FullTokens>
 void launch_mma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                 Fp8A8Workspace workspace, std::int32_t tokens, cudaStream_t stream) {
     static_assert((kFp8AttnInputQueryRows % Schedule::kBlockRows) == 0);
@@ -23,7 +22,7 @@ void launch_mma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor
     constexpr int kRowTiles = Geometry::kOutputRows / Schedule::kBlockRows;
     const int token_tiles   = (tokens + Schedule::kBlockTokens - 1) / Schedule::kBlockTokens;
     const int blocks        = kRowTiles * token_tiles;
-    const Fp8AttentionInputOutput output{
+    const Output output{
         static_cast<__nv_bfloat16*>(q.data),
         static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data),
@@ -39,13 +38,15 @@ void launch_mma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <class Schedule>
+template <class Geometry, class Output, class Schedule>
 void run(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
          Fp8A8Workspace workspace, int tokens, cudaStream_t stream) {
     if (tokens % Schedule::kBlockTokens == 0)
-        launch_mma<Schedule, true>(weight, q, gate, k, v, workspace, tokens, stream);
+        launch_mma<Geometry, Output, Schedule, true>(weight, q, gate, k, v, workspace, tokens,
+                                                     stream);
     else
-        launch_mma<Schedule, false>(weight, q, gate, k, v, workspace, tokens, stream);
+        launch_mma<Geometry, Output, Schedule, false>(weight, q, gate, k, v, workspace, tokens,
+                                                      stream);
 }
 } // namespace
 
@@ -67,16 +68,32 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
     using Prefill   = Fp8MmaSchedule<64, 128, 128, 2, 4, 2, 2, Cache::cg, Cache::cg,
                                      Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast>;
     if (x.ne[1] <= 32)
-        run<Small32>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+        run<Fp8AttnInputGeometry, Fp8AttentionInputOutput, Small32>(
+            weight, q, gate, k, v, workspace, x.ne[1], stream);
     else if (x.ne[1] <= 64)
-        run<Small64>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+        run<Fp8AttnInputGeometry, Fp8AttentionInputOutput, Small64>(
+            weight, q, gate, k, v, workspace, x.ne[1], stream);
     else if (x.ne[1] <= 96)
-        run<ShortTail>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+        run<Fp8AttnInputGeometry, Fp8AttentionInputOutput, ShortTail>(
+            weight, q, gate, k, v, workspace, x.ne[1], stream);
     else if (x.ne[1] <= 128)
-        run<Wide128>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+        run<Fp8AttnInputGeometry, Fp8AttentionInputOutput, Wide128>(
+            weight, q, gate, k, v, workspace, x.ne[1], stream);
     else if (x.ne[1] <= 144)
-        run<Tail144>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+        run<Fp8AttnInputGeometry, Fp8AttentionInputOutput, Tail144>(
+            weight, q, gate, k, v, workspace, x.ne[1], stream);
     else
-        run<Prefill>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+        run<Fp8AttnInputGeometry, Fp8AttentionInputOutput, Prefill>(
+            weight, q, gate, k, v, workspace, x.ne[1], stream);
 }
+
+    void fp8_attn_input_a8_launch_shard(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                        Tensor& k, Tensor& v, Fp8A8Workspace workspace,
+                        cudaStream_t stream) {
+        using Geometry = Fp8AttnInputTp2ColumnGeometry;
+        using Output   = Fp8AttentionInputShardOutput<Geometry>;
+        using Schedule = typename Fp8LinearA8ProductionSchedule<Geometry>::Type;
+        launch_fp8_a8_quantize(x, weight, workspace, stream);
+        run<Geometry, Output, Schedule>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+    }
 } // namespace ninfer::ops::detail

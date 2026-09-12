@@ -808,6 +808,21 @@ void KVExecutionTablePool::publish(KVExecutionRowHandle row_handle, std::uint32_
                     std::span<const std::int32_t>(shadow, page_leases.size()), stream);
 }
 
+void KVExecutionTablePool::publish_physical_indices(
+    KVExecutionRowHandle row_handle, std::uint32_t logical_begin,
+    std::span<const std::int32_t> indices, cudaStream_t stream) {
+    if (!valid_handle(row_handle) || logical_begin > logical_page_capacity() ||
+        indices.size() > logical_page_capacity() - logical_begin) {
+        throw std::invalid_argument("Paged KV physical mapping is outside its execution row");
+    }
+    for (const std::int32_t index : indices) {
+        if (index < 0 || static_cast<std::uint32_t>(index) >= pages_->capacity_pages()) {
+            throw std::invalid_argument("Paged KV physical mapping names an invalid page");
+        }
+    }
+    publish_indices(row_handle, logical_begin, indices, stream);
+}
+
 void KVExecutionTablePool::publish_repeated(KVExecutionRowHandle row_handle,
                                             DeviceKVPageHandle page, std::uint32_t count,
                                             cudaStream_t stream) {

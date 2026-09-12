@@ -135,7 +135,7 @@ struct Package {
                                                                const EngineOptions& options,
                                                                WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<Program>
-    create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device,
+    create_program(const LoadedModel& model, SequencePlan&& plan, ExecutionContext& execution,
                    const StartupObserver& startup_observer);
 };
 

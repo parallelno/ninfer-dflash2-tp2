@@ -346,6 +346,9 @@ public:
                  std::span<const DeviceKVPageHandle> pages, cudaStream_t stream = nullptr);
     void publish(KVExecutionRowHandle row, std::uint32_t logical_begin,
                  std::span<const DeviceKVPageLease> pages, cudaStream_t stream = nullptr);
+    void publish_physical_indices(KVExecutionRowHandle row, std::uint32_t logical_begin,
+                                  std::span<const std::int32_t> indices,
+                                  cudaStream_t stream = nullptr);
     void publish_repeated(KVExecutionRowHandle row, DeviceKVPageHandle page, std::uint32_t count,
                           cudaStream_t stream = nullptr);
 

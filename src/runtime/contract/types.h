@@ -231,6 +231,18 @@ struct PrefillWork {
     [[nodiscard]] friend constexpr bool operator==(PrefillWork, PrefillWork) noexcept = default;
 };
 
+[[nodiscard]] constexpr std::uint64_t saturating_multiply_u64(std::uint64_t left,
+                                                              std::uint64_t right) noexcept {
+    constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+    return left != 0 && right > maximum / left ? maximum : left * right;
+}
+
+[[nodiscard]] constexpr std::uint64_t saturating_add_u64(std::uint64_t left,
+                                                         std::uint64_t right) noexcept {
+    constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+    return right > maximum - left ? maximum : left + right;
+}
+
 // Exact prefill feature definition for a suffix beginning after prefix_tokens. Attention work is
 // prefix*suffix + suffix*(suffix+1)/2 and all arithmetic saturates.
 [[nodiscard]] inline PrefillWork make_prefill_work(std::uint64_t prefix_tokens,
@@ -244,15 +256,12 @@ struct PrefillWork {
     result.tokens                       = suffix_tokens;
     result.vision_items                 = vision_items;
     result.vision_patches               = vision_patches;
-    const unsigned __int128 suffix      = suffix_tokens;
-    const unsigned __int128 linear      = static_cast<unsigned __int128>(prefix_tokens) * suffix;
-    const unsigned __int128 triangular  = suffix * (suffix + 1U) / 2U;
-    constexpr unsigned __int128 maximum = ~static_cast<unsigned __int128>(0);
-    const unsigned __int128 attention =
-        triangular > maximum - linear ? maximum : linear + triangular;
-    result.attention_pairs = attention > std::numeric_limits<std::uint64_t>::max()
-                                 ? std::numeric_limits<std::uint64_t>::max()
-                                 : static_cast<std::uint64_t>(attention);
+    const bool suffix_even = suffix_tokens % 2U == 0;
+    const std::uint64_t triangular =
+        saturating_multiply_u64(suffix_even ? suffix_tokens / 2U : suffix_tokens,
+                                suffix_even ? suffix_tokens + 1U : suffix_tokens / 2U + 1U);
+    result.attention_pairs = saturating_add_u64(
+        saturating_multiply_u64(prefix_tokens, suffix_tokens), triangular);
     return result;
 }
 

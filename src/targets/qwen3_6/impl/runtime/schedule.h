@@ -70,12 +70,14 @@ struct TpPeerCore {
     // Present only when the sequence plan enables MTP.
     const qwen3_6::PagedKVCache* mtp_cache  = nullptr;
     const GdnReplayRecords* replay_records  = nullptr;
+    Tensor* continuation_hidden_store       = nullptr;
     // Rank 1's own pinned MTP ingress record (see PeerRuntime::token_counts). It differs from
     // rank 0's only in the per-row `sampling[row].token_counts` pointer, which must name rank 1's
     // counter lane: `speculative_accept_greedy_drafts` READS and atomically WRITES that pointer
     // in sampling mode, and a pointer into the other device's arena is an illegal access without
     // peer mapping and a silent double-increment with it.
     const qwen3_6::MtpDecodeIngress* mtp_host_ingress = nullptr;
+    const qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     // Enrolls rank 1's stream in rank 0's capture. Null when graphs are disabled; the eager path
     // never reads it.
     const DecodeGraphPeerBridge* graph_bridge = nullptr;
@@ -219,6 +221,10 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent);
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
+                          ops::CausalAttentionExecutionEnvelope envelope);
+void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
+                          TextContext& card, TargetVerifyFrameView frame,
+                          TargetVerifyFrameView peer,
                           ops::CausalAttentionExecutionEnvelope envelope);
 
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(PrefillContext& state,

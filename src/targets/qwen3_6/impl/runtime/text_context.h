@@ -9,6 +9,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "ninfer/ops/rope.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/sparse_moe.h"
@@ -320,23 +321,24 @@ public:
                              const std::array<Tensor, 2>& rope_positions,
                              const std::array<Tensor, 2>& valid_columns,
                              const std::array<Tensor, 2>& kv_table_rows,
-                             const std::array<Tensor, 2>& linear_state_slots,
-                             ops::GqaExecutionEnvelope envelope,
+                             const std::array<Tensor, 2>& linear_state_source_slots,
+                             ops::CausalAttentionExecutionEnvelope envelope,
                              const std::array<Tensor, 2>& hidden,
                              const std::array<Tensor, 2>& logits,
-                             const std::array<Tensor, 2>& target_tokens);
+                             const std::array<Tensor, 2>& target_tokens,
+                             DFlashFeatureSink* feature_sink = nullptr);
     void mtp_forward_decode_batch(const Tensor& ids, const std::array<Tensor, 2>& hidden,
                                   const std::array<Tensor, 2>& cache_positions,
                                   const std::array<Tensor, 2>& rope_positions,
                                   const std::array<Tensor, 2>& valid_columns,
                                   const std::array<Tensor, 2>& kv_table_rows,
-                                  ops::GqaExecutionEnvelope envelope,
+                                  ops::CausalAttentionExecutionEnvelope envelope,
                                   const std::array<Tensor, 2>& mtp_hidden);
     void mtp_propose_batch(const std::array<Tensor, 2>& hidden,
                            const std::array<Tensor, 2>& logits, Tensor& draft_tokens);
     void mtp_forward_ar_step(const Tensor& token, const std::array<Tensor, 2>& previous_hidden,
                              const std::array<Tensor, 2>& position,
-                             ops::GqaExecutionEnvelope envelope,
+                             ops::CausalAttentionExecutionEnvelope envelope,
                              const std::array<Tensor, 2>& mtp_hidden,
                              const std::array<Tensor, 2>& logits, Tensor& draft_token);
 private:
@@ -381,7 +383,8 @@ private:
     [[nodiscard]] const Tensor& rank_kv_table_rows(int rank) const;
     [[nodiscard]] const Tensor& rank_backend_kv_table_rows(int rank) const;
     [[nodiscard]] Tensor rank_valid_columns(int rank) const;
-    [[nodiscard]] const Tensor& rank_linear_state_slots(int rank) const;
+    [[nodiscard]] const Tensor& rank_linear_state_source_slots(int rank) const;
+    [[nodiscard]] const Tensor& rank_linear_state_destination_slots(int rank) const;
     void synchronize_all() const;
     void attn_mix_tp2(const FullLayerW& w0, const FullLayerW& w1, std::array<Tensor, 2>& x,
                       int index, Phase phase, const std::array<Tensor, 2>& staging);
@@ -391,16 +394,18 @@ private:
                       const MlpW& m1, std::array<Tensor, 2>& x, Phase phase,
                       const std::array<Tensor, 2>& staging);
     void run_layers_tp2(std::array<Tensor, 2>& x, Phase phase,
-                        const std::array<Tensor, 2>& staging);
+                        const std::array<Tensor, 2>& staging,
+                        DFlashFeatureSink* feature_sink = nullptr);
     // Vocabulary-split head: each rank computes its own half of the logits, then one allgather
     // per column leaves the FULL logits on both ranks. Sampling then runs on rank 0 alone.
     void logits_tp2(const std::array<Tensor, 2>& hidden, Tensor& logits,
                     Tensor& peer_logits);
     void ordinary_decode_batch_tp2(const Tensor& ids, const Tensor& cache_positions,
                                    const Tensor& rope_positions, const Tensor& kv_table_rows,
-                                   const Tensor& linear_state_slots,
-                                   ops::GqaExecutionEnvelope envelope, Tensor& hidden,
-                                   Tensor& logits);
+                                   const Tensor& linear_state_source_slots,
+                                   const Tensor& linear_state_destination_slots,
+                                   ops::CausalAttentionExecutionEnvelope envelope,
+                                   Tensor& hidden, Tensor& logits);
     // --- tp == 2 MTP -----------------------------------------------------------------------
     // The MTP head is one layer, so its split schedule is the text layer's split schedule with a
     // single instance of each stage: a ROW-parallel stem (no pack -- each rank's K-slice already
@@ -417,18 +422,18 @@ private:
     void mtp_forward_tail_tp2(std::array<Tensor, 2>& x, const std::array<Tensor, 2>& ah,
                               const std::array<Tensor, 2>& positions,
                               const std::array<Tensor, 2>& rope_positions,
-                              ops::GqaExecutionEnvelope envelope,
+                              ops::CausalAttentionExecutionEnvelope envelope,
                               const std::array<Tensor, 2>& mtp_hidden,
                               const std::array<Tensor, 2>& staging);
     void mtp_forward_core_tp2(const Tensor& ids, const std::array<Tensor, 2>& hidden,
                               const std::array<Tensor, 2>& positions,
                               const std::array<Tensor, 2>& rope_positions,
-                              ops::GqaExecutionEnvelope envelope,
+                              ops::CausalAttentionExecutionEnvelope envelope,
                               const std::array<Tensor, 2>& mtp_hidden);
     void mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tensor, 2>& hidden,
                                const std::array<Tensor, 2>& positions,
                                const std::array<Tensor, 2>& rope_positions,
-                               ops::GqaExecutionEnvelope envelope, bool final_chunk,
+                               ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
                                const std::array<Tensor, 2>* final_hidden,
                                const std::array<Tensor, 2>* logits, Tensor* draft_token);
     // Vocabulary-split proposal head: each rank computes its own half of the proposal logits and
@@ -544,7 +549,8 @@ private:
     const Tensor* peer_cache_positions_          = nullptr;
     const Tensor* peer_rope_positions_           = nullptr;
     const Tensor* peer_kv_table_rows_            = nullptr;
-    const Tensor* peer_linear_state_slots_       = nullptr;
+    const Tensor* peer_linear_state_source_slots_      = nullptr;
+    const Tensor* peer_linear_state_destination_slots_ = nullptr;
     const Tensor* peer_valid_columns_            = nullptr;
 
     const Tensor* peer_backend_kv_table_rows_    = nullptr;
