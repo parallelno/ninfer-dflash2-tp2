@@ -1117,6 +1117,33 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
     if (peer) {
+        if (plan.context_cache.host_state_slots != 0 ||
+            plan.context_cache.host_kv_capacity_bytes != 0) {
+            throw std::invalid_argument(
+                "Host context-cache tiers are not supported at tp == 2; use --host-state-slots 0 "
+                "and --host-kv-mib 0");
+        }
+        // Rank 1 owns no page/slot bookkeeping: every addressing mutation rank 0 makes to its KV
+        // execution tables, physical KV pages, and StateImage slots is replayed onto rank 1's
+        // replicas at the same indices on rank 1's stream. Without this rank 1 attends through
+        // never-published block tables and continues from never-reset GDN state.
+        const DeviceKVMirror peer_kv_mirror{.device = peer->device.device,
+                                            .stream = peer->device.stream};
+        decoder->text_kv.page_pool().attach_mirror(peer->decoder->text_kv.page_pool(),
+                                                   peer_kv_mirror);
+        decoder->text_kv.execution_tables().attach_mirror(
+            peer->decoder->text_kv.execution_tables(), peer_kv_mirror);
+        if (decoder->mtp_cache() != nullptr) {
+            if (peer->decoder->mtp_cache() == nullptr) {
+                throw std::logic_error("peer MTP KV cache does not match rank 0's");
+            }
+            decoder->mtp_cache()->page_pool().attach_mirror(peer->decoder->mtp_cache()->page_pool(),
+                                                            peer_kv_mirror);
+            decoder->mtp_cache()->execution_tables().attach_mirror(
+                peer->decoder->mtp_cache()->execution_tables(), peer_kv_mirror);
+        }
+        state_images->attach_mirror(*peer->state_images, peer->device.device, peer->device.stream);
+
         int previous = 0;
         CUDA_CHECK(cudaGetDevice(&previous));
         CUDA_CHECK(cudaSetDevice(peer->device.device));
@@ -11394,7 +11421,8 @@ void ProgramImplCore::prepare_graphs() {
         schedule::OrdinaryBatchContext ordinary_state{
             execution_core(),      decoder->text_kv,
             *io.ordinary,          *ordinary_host_ingress,
-            *ordinary_host_egress, state_images->continuation_hidden_store()};
+            *ordinary_host_egress, state_images->continuation_hidden_store(),
+            ordinary_peer_host_ingress};
         const GraphExecutionProfile code_warm = ordinary_profiles.front();
         prepare_representative(code_warm.min, 1);
         synchronize_all();
@@ -12150,12 +12178,14 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{{device, model, work, state_images->linear(),
                                                        replay_records ? &*replay_records : nullptr,
                                                        io, prefill_hidden, prefill_chunk,
-                                                       proposal_head},
+                                                       proposal_head, rope_frequency,
+                                                       peer_core ? &*peer_core : nullptr},
                                                       decoder->text_kv,
                                                       *io.ordinary,
                                                       *ordinary_host_ingress,
                                                       *ordinary_host_egress,
-                                                      state_images->continuation_hidden_store()};
+                                                      state_images->continuation_hidden_store(),
+                                                      ordinary_peer_host_ingress};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
         schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),

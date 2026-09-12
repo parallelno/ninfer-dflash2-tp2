@@ -137,12 +137,19 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         constexpr std::size_t kDynamicBytes =
             DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kCausalHeadDim) : 0u;
         if constexpr (DynamicArena) {
-            static const cudaError_t attr = cudaFuncSetAttribute(
-                causal_attention_small_t_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
-                                                         MinBlocksPerSm, KeyBlock, DynamicArena,
-                                                         MultiBatch, Masked, CacheInput>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
-            CUDA_CHECK(attr);
+            // Function attributes are per-device; TP replays this launch on every GPU.
+            static bool attr_set[16] = {};
+            int device               = 0;
+            CUDA_CHECK(cudaGetDevice(&device));
+            if (device >= 16) { throw std::runtime_error("small_t i8: device index out of range"); }
+            if (!attr_set[device]) {
+                CUDA_CHECK(cudaFuncSetAttribute(
+                    causal_attention_small_t_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
+                                                             MinBlocksPerSm, KeyBlock, DynamicArena,
+                                                             MultiBatch, Masked, CacheInput>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes)));
+                attr_set[device] = true;
+            }
         }
         causal_attention_small_t_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
                                                  KeyBlock, DynamicArena, MultiBatch, Masked,

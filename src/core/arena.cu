@@ -148,6 +148,14 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
     }
+    // Arena-backed persistent state (KV pages, StateImage slots, feature sinks) is only zeroed
+    // per component on reuse. Zero the whole allocation once so the very first requests after
+    // startup see the same (zeroed) padding as every later request that reuses those regions.
+    const cudaError_t zeroed = cudaMemset(ptr, 0, capacity_bytes);
+    if (zeroed != cudaSuccess) {
+        free_device(ptr);
+        throw std::runtime_error(cuda_error_message("cudaMemset failed", zeroed));
+    }
 
     base_ = ptr;
     cap_  = capacity_bytes;

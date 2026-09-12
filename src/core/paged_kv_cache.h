@@ -107,6 +107,17 @@ class KVExecutionTablePool;
 class HostKVAllocationView;
 class HostKVAllocationConstView;
 
+/**
+ * A second device's replica of one pool, kept byte-identical in *addressing* by repeating every
+ * physical-page copy/zero and every execution-table publication onto it. Tensor-parallel rank 1
+ * owns its own halved KV planes and tables but no page/address bookkeeping, so rank 0's pool
+ * replays each addressing mutation onto rank 1's pool at the same physical indices.
+ */
+struct DeviceKVMirror {
+    int device          = -1;
+    cudaStream_t stream = nullptr;
+};
+
 /** Copyable, non-owning physical-page capability minted by one DeviceKVPagePool. */
 class DeviceKVPageHandle {
 public:
@@ -227,6 +238,11 @@ public:
                        std::vector<DeviceKVPageLease>& source);
     void dematerialize_one(DeviceKVPageReservation& reservation, DeviceKVPageLease&& page);
 
+    // Every zero_pages/copy_page issued here is repeated at the same physical indices on `mirror`
+    // (another device's pool of identical page capacity) on `where.stream`. Host transfers are
+    // rejected while a mirror is attached: the Host tiers are not tensor-parallel aware.
+    void attach_mirror(const DeviceKVPagePool& mirror, DeviceKVMirror where);
+
     void zero_pages(std::span<const DeviceKVPageHandle> pages, cudaStream_t stream = nullptr) const;
     void copy_page(DeviceKVPageHandle source, DeviceKVPageHandle destination,
                    cudaStream_t stream = nullptr) const;
@@ -244,6 +260,10 @@ private:
 
     [[nodiscard]] bool valid_handle(DeviceKVPageHandle handle) const noexcept;
     [[nodiscard]] std::int32_t physical_index(DeviceKVPageHandle handle) const;
+    void zero_run(std::int32_t first, std::int32_t count, cudaStream_t stream) const;
+    void copy_run(std::int32_t source_index, std::int32_t destination_index,
+                  cudaStream_t stream) const;
+    void require_no_mirror(const char* what) const;
     void validate_distinct_pages(std::span<const DeviceKVPageHandle> pages,
                                  const char* duplicate_message) const;
     void consume_free_run(std::size_t run_index, std::int32_t begin, std::uint32_t count) noexcept;
@@ -265,6 +285,8 @@ private:
     mutable std::uint32_t validation_stamp_ = 0;
     std::uint32_t allocated_pages_          = 0;
     std::uint32_t reserved_pages_           = 0;
+    const DeviceKVPagePool* mirror_         = nullptr;
+    DeviceKVMirror mirror_where_;
 };
 
 struct DeviceKVPageReservationRequest {
@@ -342,6 +364,10 @@ public:
     [[nodiscard]] std::int32_t row_count() const noexcept;
     [[nodiscard]] KVExecutionRowLease acquire(std::int32_t row);
 
+    // Every publication into a row here is repeated into the same row of `mirror` (another
+    // device's table pool of identical geometry) on `where.stream`.
+    void attach_mirror(const KVExecutionTablePool& mirror, DeviceKVMirror where);
+
     void publish(KVExecutionRowHandle row, std::uint32_t logical_begin,
                  std::span<const DeviceKVPageHandle> pages, cudaStream_t stream = nullptr);
     void publish(KVExecutionRowHandle row, std::uint32_t logical_begin,
@@ -370,6 +396,8 @@ private:
     PinnedHostBuffer host_shadow_;
     std::vector<bool> row_in_use_;
     std::vector<std::uint32_t> row_generations_;
+    const KVExecutionTablePool* mirror_ = nullptr;
+    DeviceKVMirror mirror_where_;
 };
 
 } // namespace ninfer

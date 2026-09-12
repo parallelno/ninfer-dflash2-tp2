@@ -139,7 +139,15 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         startup_observer == nullptr ? no_startup_observer : *startup_observer;
     std::uint64_t total = 0;
     for (const DeviceMaterialization& placement : plan.device_objects) {
-        total = checked_add(total, placement.bytes, "artifact tensor byte count overflows u64");
+        // Sharded placements copy only their plane ranges; alignment gaps between planes are
+        // zero-filled below rather than copied, so they must not count toward the H2D total.
+        if (placement.copies.empty()) {
+            total = checked_add(total, placement.bytes, "artifact tensor byte count overflows u64");
+        } else {
+            for (const PlaneCopy& copy : placement.copies) {
+                total = checked_add(total, copy.bytes, "artifact tensor byte count overflows u64");
+            }
+        }
     }
     StartupPhaseScope materialize_phase(startup, StartupPhase::WeightsMaterialize,
                                         StartupProgressUnit::Bytes, total);
@@ -217,13 +225,36 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         }
         out.objects_.at(placement.object.index).device[slot]       = storage.data;
         out.objects_.at(placement.object.index).device_bytes[slot] = placement.bytes;
-        ranges.push_back(CopyRange{
-            .source_begin = payload.absolute_offset,
-            .source_end   = checked_add(payload.absolute_offset, placement.bytes,
-                                        "artifact tensor source range overflows u64"),
-            .destination  = static_cast<std::byte*>(storage.data),
-            .device       = placement.device,
-        });
+        // A sharded placement carries per-plane copy ranges (row slices of the parent payload,
+        // possibly landing at different plane offsets on the device). Honor them; only a
+        // whole-object placement copies the payload verbatim.
+        auto* const base     = static_cast<std::byte*>(storage.data);
+        const auto add_range = [&](std::uint64_t source_offset, std::uint64_t dest_offset,
+                                   std::uint64_t bytes) {
+            if (source_offset > payload.data.size() ||
+                payload.data.size() - source_offset < bytes || dest_offset > placement.bytes ||
+                placement.bytes - dest_offset < bytes) {
+                throw ArtifactError("materialization plan does not match artifact payload");
+            }
+            ranges.push_back(CopyRange{
+                .source_begin = checked_add(payload.absolute_offset, source_offset,
+                                            "artifact tensor source range overflows u64"),
+                .source_end   = checked_add(payload.absolute_offset + source_offset, bytes,
+                                            "artifact tensor source range overflows u64"),
+                .destination  = base + dest_offset,
+                .device       = placement.device,
+            });
+        };
+        if (placement.copies.empty()) {
+            if (payload.data.size() != placement.bytes) {
+                throw ArtifactError("materialization plan does not match artifact payload");
+            }
+            add_range(0, 0, placement.bytes);
+        } else {
+            for (const PlaneCopy& copy : placement.copies) {
+                add_range(copy.source_offset, copy.dest_offset, copy.bytes);
+            }
+        }
     }
     if (ranges.empty()) { throw ArtifactError("materialization plan has no device tensors"); }
     // Destination ranges must stay disjoint *within* a device. The single-device path used to get
