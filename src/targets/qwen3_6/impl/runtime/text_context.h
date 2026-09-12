@@ -496,7 +496,8 @@ private:
     // TextPrefill, which is declared just above this line.
     [[nodiscard]] PrefillChunkResult prefill_impl_tp2(std::span<const int> ids,
                                                       const TextPrefill& text_prefill,
-                                                      bool finalize_at_end);
+                                                      bool finalize_at_end,
+                                                      DFlashFeatureSink* feature_sink);
     DeviceContext& ctx_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;

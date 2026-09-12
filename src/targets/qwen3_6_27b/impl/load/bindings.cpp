@@ -612,7 +612,7 @@ ShardMapping shard_mapping(std::string_view object, int tp, const TextConfig& co
     if (ends("token_embedding") || ends("final_norm") || ends("input_norm") ||
         ends("post_attention_norm") || ends("attention/query_norm") ||
         ends("attention/key_norm") || ends("gdn/norm") || ends("embedding_norm") ||
-        ends("hidden_norm") || ends("draft_head_token_ids") ||
+        ends("hidden_norm") || ends("draft_head") || ends("draft_head_token_ids") ||
         object.starts_with("dflash2/")) {
         return {};
     }
@@ -832,14 +832,9 @@ ShardMapping shard_mapping(std::string_view object, int tp, const TextConfig& co
         return by_columns(std::move(plan));
     }
 
-    // Vocab row-splits: replicated token_embedding's twin (output_head) and the draft head.
-    // NOTE `draft_head_token_ids` is NOT here -- it is replicated, see the replicated block above.
+    // Vocab row-split: replicated token_embedding's twin (output_head).
     if (ends("output_head")) {
         append_vocab_rows(plan, static_cast<std::uint64_t>(config.output_rows), tp, object);
-        return by_rows(std::move(plan));
-    }
-    if (ends("draft_head")) {
-        append_vocab_rows(plan, kDraftHeadRows, tp, object);
         return by_rows(std::move(plan));
     }
 
@@ -1077,9 +1072,7 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
         auto& proposal = runtime.optimized_proposal.emplace();
         proposal.head =
             artifact::materialized_weight(backing, plan.draft_head, NumericFormat::Q4G64_F16S,
-                                          131072 / tp, 5120, device);
-        // Replicated: the winning index comes from a GLOBAL argmax over the allgathered proposal
-        // logits and can name a row in either half.
+                                          131072, 5120, device);
         proposal.token_ids = artifact::materialized_tensor(backing, plan.draft_head_token_ids,
                                                            NumericFormat::I32, {131072}, device);
     }

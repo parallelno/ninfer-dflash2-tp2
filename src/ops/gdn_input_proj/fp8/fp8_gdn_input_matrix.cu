@@ -90,6 +90,12 @@ void fp8_gdn_input_small_t_launch_shard(const Tensor& x, const Weight& weight, T
     case 2: return launch_exact<Geometry, Output, 2>(x, weight, qkv, z, stream);
     case 3: return launch_exact<Geometry, Output, 3>(x, weight, qkv, z, stream);
     case 4: return launch_exact<Geometry, Output, 4>(x, weight, qkv, z, stream);
+    case 5: return launch_exact<Geometry, Output, 5>(x, weight, qkv, z, stream);
+    case 6: return launch_exact<Geometry, Output, 6>(x, weight, qkv, z, stream);
+    case 7: return launch_exact<Geometry, Output, 7>(x, weight, qkv, z, stream);
+    case 8: return launch_exact<Geometry, Output, 8>(x, weight, qkv, z, stream);
+    case 9: return launch_exact<Geometry, Output, 9>(x, weight, qkv, z, stream);
+    case 10: return launch_exact<Geometry, Output, 10>(x, weight, qkv, z, stream);
     default: throw std::invalid_argument("fp8 gdn_input_proj column-parallel small-T: unsupported T");
     }
 }

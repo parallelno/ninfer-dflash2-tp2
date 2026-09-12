@@ -18,6 +18,8 @@ project(ninfer LANGUAGES C CXX CUDA)
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
+set(NINFER_CUDA_SPLIT_COMPILE_THREADS 20 CACHE STRING
+  "Threads used by nvcc to optimize one CUDA translation unit (0=all CPUs, 1=disabled)")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -49,6 +51,15 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
   message(FATAL_ERROR
     "NInfer requires CUDA 12.8 or newer (sm_120a Blackwell support); found CUDA compiler "
     "${CMAKE_CUDA_COMPILER_VERSION}")
+endif()
+if(NOT NINFER_CUDA_SPLIT_COMPILE_THREADS MATCHES "^[0-9]+$")
+  message(FATAL_ERROR
+    "NINFER_CUDA_SPLIT_COMPILE_THREADS must be a non-negative integer; got "
+    "'${NINFER_CUDA_SPLIT_COMPILE_THREADS}'")
+endif()
+if(NOT NINFER_CUDA_SPLIT_COMPILE_THREADS STREQUAL "1")
+  add_compile_options(
+    $<$<COMPILE_LANGUAGE:CUDA>:--split-compile=${NINFER_CUDA_SPLIT_COMPILE_THREADS}>)
 endif()
 
 # nvcc < 13.1 does not officially support MSVC 19.4x. The host-side code is standard

@@ -36,6 +36,11 @@ std::uint32_t normalized_private_capacity(const ContextCacheOptions& options) {
     return *options.max_private_continuations;
 }
 
+std::size_t bind_device_for_arena(DeviceContext& device, std::size_t bytes) {
+    device.bind_to_current_thread();
+    return bytes;
+}
+
 qwen3_6::detail::YarnParams yarn_params(const SequencePlanImpl& plan) {
     return qwen3_6::detail::YarnParams{
         .factor        = static_cast<float>(plan.yarn_factor),
@@ -769,7 +774,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
       use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
-      persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
+    persistent(bind_device_for_arena(execution_in.primary(), plan.persistent.bytes)),
+    workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
     rope_mode(plan.rope_mode), effective_max_context(plan.effective_max_context),
     yarn_mscale(qwen3_6::detail::yarn_rope_mscale(yarn_params(plan))),

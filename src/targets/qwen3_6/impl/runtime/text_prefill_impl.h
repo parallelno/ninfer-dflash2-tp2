@@ -53,11 +53,14 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                                       std::uint32_t nominal_length,
                                       std::optional<std::uint32_t> split_frontier,
                                       bool finalize_at_end) {
+    std::optional<TpExecution> tp = tp_execution(state.execution);
+    if (tp) { tp->mtp_kv = state.mtp_kv_peer; }
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
                      state.execution.rope_frequency, state.text_kv,
                      state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
+                     tp ? &*tp : nullptr);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
@@ -77,11 +80,14 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
                                             std::uint32_t nominal_length,
                                             std::optional<std::uint32_t> split_frontier,
                                             bool finalize_at_end) {
+    std::optional<TpExecution> tp = tp_execution(state.execution);
+    if (tp) { tp->mtp_kv = state.mtp_kv_peer; }
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
                      state.execution.rope_frequency, state.text_kv,
                      state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
+                     tp ? &*tp : nullptr);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);

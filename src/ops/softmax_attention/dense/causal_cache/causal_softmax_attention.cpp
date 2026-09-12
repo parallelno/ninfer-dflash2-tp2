@@ -25,7 +25,7 @@ constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
 std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t width,
                                            std::int32_t batch_size, KvCacheStorage storage,
                                            CausalAttentionExecutionEnvelope envelope) {
-    if (q_heads == 16) return 6;
+    if (q_heads == 12 || q_heads == 16) return 6;
     // Balance the two narrow BF16 chunks; INT8 benefits from 5+4/5 at long contexts.
     if (batch_size == 1 && ((storage == KvCacheStorage::BFloat16 && width >= 9 && width <= 12) ||
                             (storage == KvCacheStorage::Int8Group64 && width >= 9 && width <= 10 &&
@@ -37,6 +37,7 @@ std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t wi
 void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
         !((geometry.query_heads == 24 && geometry.kv_heads == 4) ||
+          (geometry.query_heads == 12 && geometry.kv_heads == 2) ||
           (geometry.query_heads == 16 && geometry.kv_heads == 2))) {
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
     }
@@ -368,6 +369,9 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
             if (envelope.max_visible_keys <= prompt_limit) return CausalAttentionRoute::Prompt;
         }
         return width <= 8 ? CausalAttentionRoute::SmallT : CausalAttentionRoute::ChunkedSmallT;
+    }
+    if (q_heads == 12) {
+        return width <= 6 ? CausalAttentionRoute::SmallT : CausalAttentionRoute::ChunkedSmallT;
     }
     if (width <= 6) return CausalAttentionRoute::SmallT;
     if (batch_size > 1) return CausalAttentionRoute::ChunkedSmallT;
