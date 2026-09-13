@@ -106,6 +106,7 @@ struct PhaseProgress {
     Clock::time_point sample_time;
     std::uint64_t sample_bytes       = 0;
     double smoothed_bytes_per_second = 0.0;
+    bool persistent_logged           = false;
 };
 
 void update_rate(PhaseProgress& state, std::uint64_t current, Clock::time_point now) {
@@ -242,6 +243,7 @@ struct StartupLogRenderer::Impl {
             }
             if (now - state.last_persistent < kPersistentRefresh) { return; }
             state.last_persistent = now;
+            state.persistent_logged = true;
             if (event.progress_unit == StartupProgressUnit::Bytes && event.total != 0) {
                 logger->info("{}", progress_line_candidate(presentation, event, state,
                                                            static_cast<double>(event.current) /
@@ -255,6 +257,13 @@ struct StartupLogRenderer::Impl {
             if (event.phase == StartupPhase::EngineStartup) {
                 engine_elapsed_ns = event.elapsed_ns;
                 return;
+            }
+            // Persistent progress is throttled, so the 100% line is otherwise never printed.
+            if (!progress->enabled() && phases[index].persistent_logged &&
+                event.progress_unit == StartupProgressUnit::Bytes && event.total != 0 &&
+                event.current >= event.total) {
+                logger->info("{}", progress_line_candidate(presentation, event, phases[index], 1.0,
+                                                           0, true, false, false));
             }
             const std::string line = complete_line(presentation, event);
             if (presentation.visibility == PhaseVisibility::Info) {
