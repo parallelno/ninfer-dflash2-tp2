@@ -191,6 +191,24 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         std::count_if(plan.device_objects.begin(), plan.device_objects.end(),
                       [](const DeviceMaterialization& placement) { return placement.device == 0; }));
     out.stats_.resource_count = plan.host_objects.size();
+    {
+        // Placement kind per object: a sharded object carries plane copies; a whole object placed
+        // on every device is replicated; a whole object placed on fewer devices is device-local.
+        std::vector<int> whole_placements(plan.object_count, 0);
+        for (const DeviceMaterialization& placement : plan.device_objects) {
+            if (placement.copies.empty()) { ++whole_placements.at(placement.object.index); }
+        }
+        for (const DeviceMaterialization& placement : plan.device_objects) {
+            const auto slot = static_cast<std::size_t>(placement.device);
+            if (!placement.copies.empty()) {
+                out.stats_.per_device_sharded_bytes[slot] += placement.bytes;
+            } else if (whole_placements[placement.object.index] == device_count) {
+                out.stats_.per_device_replicated_bytes[slot] += placement.bytes;
+            } else {
+                out.stats_.per_device_local_bytes[slot] += placement.bytes;
+            }
+        }
+    }
 
     for (const HostMaterialization& placement : plan.host_objects) {
         auto& resource            = out.objects_.at(placement.object.index).resource;

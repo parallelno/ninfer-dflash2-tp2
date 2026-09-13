@@ -911,6 +911,12 @@ struct MemorySummary {
 struct DeviceMemoryReport {
     int device                              = -1;
     std::uint64_t weights_bytes             = 0; // this device's weight arena (its own shard)
+    // Breakdown of `weights_bytes` by placement kind (padding excluded). `weights_local_bytes`
+    // is what only THIS device holds (e.g. the DFlash2 draft model on rank 0) and is the reason
+    // two ranks' weight footprints can differ.
+    std::uint64_t weights_sharded_bytes     = 0;
+    std::uint64_t weights_replicated_bytes  = 0;
+    std::uint64_t weights_local_bytes       = 0;
     std::uint64_t kv_pool_bytes             = 0; // paged KV payload
     std::uint64_t gdn_state_bytes           = 0; // GDN recurrent + conv state
     std::uint64_t sequence_bytes            = 0; // whole persistent arena (KV + GDN + round state)

@@ -589,6 +589,17 @@ ShardMapping shard_mapping(std::string_view object, int tp, const TextConfig& co
         return ShardMapping{artifact::ShardAxis::Columns, std::move(shards)};
     };
 
+    // DFlash2 draft model: rank 0 only, and checked FIRST because its leaf names (`input_norm`,
+    // `mlp/gate_up`, `attention/output`, ...) would otherwise match the text-family rules below.
+    // `propose_batch_impl` / `append_context_impl` (src/targets/qwen3_6/impl/runtime/dflash_impl.h)
+    // run every DFlash2 kernel on `state.execution.device` (rank 0) against
+    // `state.execution.model.dflash`; rank 1 only receives the finished draft tokens over the peer
+    // copy in `dflash_decode_batch_body`. A replicated copy on rank 1 (~2 GiB at W8) would never
+    // be read, and at 16 GB per card it is the difference between a 6K and a 16K+ KV window.
+    if (object.starts_with("dflash2/")) {
+        return ShardMapping{artifact::ShardAxis::PrimaryOnly, {}};
+    }
+
     // Replicated: full copy on every device (shards stays empty).
     //
     // `gdn/norm` stays here and that is VERIFIED, not inherited: its real bound shape is {128}
@@ -612,8 +623,7 @@ ShardMapping shard_mapping(std::string_view object, int tp, const TextConfig& co
     if (ends("token_embedding") || ends("final_norm") || ends("input_norm") ||
         ends("post_attention_norm") || ends("attention/query_norm") ||
         ends("attention/key_norm") || ends("gdn/norm") || ends("embedding_norm") ||
-        ends("hidden_norm") || ends("draft_head") || ends("draft_head_token_ids") ||
-        object.starts_with("dflash2/")) {
+        ends("hidden_norm") || ends("draft_head") || ends("draft_head_token_ids")) {
         return {};
     }
 
@@ -1127,7 +1137,11 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
                                                        NumericFormat::BF16, {5120}, device);
     }
 
-    if (plan.features.dflash2()) {
+    // Rank 0 only: `dflash2/*` is placed PrimaryOnly (see shard_mapping), so rank 1's arena has
+    // no bytes for it and its view leaves `dflash` empty. The DFlash2 forward runs exclusively on
+    // rank 0 (dflash_impl.h), and program construction validates `dflash` presence against rank
+    // 0's view only.
+    if (plan.features.dflash2() && device == 0) {
         if (!plan.dflash2) {
             throw std::logic_error("selected DFlash2 weights are absent from the binding plan");
         }

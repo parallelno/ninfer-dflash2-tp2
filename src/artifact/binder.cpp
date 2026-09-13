@@ -123,13 +123,16 @@ void Binder::materialize_on_device(ObjectHandle handle) {
     for (int device = 0; device < materialization_.device_count; ++device) {
         const std::vector<SliceRange>& ranges =
             placement.device_ranges[static_cast<std::size_t>(device)];
-        if (placement.axis == ShardAxis::Replicated) {
+        if (placement.axis == ShardAxis::Replicated || placement.axis == ShardAxis::PrimaryOnly) {
             if (!ranges.empty()) {
-                throw ArtifactError("a replicated placement must carry no shard ranges: " +
+                throw ArtifactError("a whole-object placement must carry no shard ranges: " +
                                     std::string(tensor->name));
             }
             // Whole object. `copies` stays empty: the materializer copies the payload verbatim,
-            // which is byte-for-byte what the single-device path has always done.
+            // which is byte-for-byte what the single-device path has always done. PrimaryOnly
+            // stops after device 0; the materializer's "every device tensor has a device-0
+            // placement" invariant still holds.
+            if (placement.axis == ShardAxis::PrimaryOnly && device != 0) { break; }
             place(handle, device, tensor->bytes, alignment, {});
             continue;
         }

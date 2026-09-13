@@ -22,11 +22,14 @@ enum class TensorPlacement : std::uint8_t {
 
 // Which logical axis of a tensor a shard map splits. `Rows` narrows axis 0 (the output/row
 // dimension: column-parallel ops), `Columns` narrows axis 1 (the input dimension: row-parallel
-// ops). `Replicated` means every device holds the whole object.
+// ops). `Replicated` means every device holds the whole object. `PrimaryOnly` means device 0
+// holds the whole object and no other device holds any of it -- for weights only rank 0 ever
+// runs (the DFlash2 draft model), so the peer does not pay for a copy it never reads.
 enum class ShardAxis : std::uint8_t {
     Replicated,
     Rows,
     Columns,
+    PrimaryOnly,
 };
 
 struct ObjectHandle {
@@ -34,8 +37,8 @@ struct ObjectHandle {
 };
 
 // The per-device shard map for one object. `device_ranges[d]` lists the ranges of `axis` that
-// device d owns, in the order they are concatenated into that device's shard. `Replicated` means
-// every device holds the complete object and carries no ranges at all; under `Rows` or `Columns`
+// device d owns, in the order they are concatenated into that device's shard. `Replicated` and
+// `PrimaryOnly` carry no ranges at all; under `Rows` or `Columns`
 // every device in the plan must name at least one range -- an empty list there is rejected rather
 // than quietly promoted to a full copy, since "this device happens to own nothing" is far more
 // likely to be a shard-map bug than an intent.

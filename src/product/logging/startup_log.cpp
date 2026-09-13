@@ -310,6 +310,38 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
                         format_pretty_text(load.model_id), format_pretty_text(load.weights_id),
                         format_pretty_duration(total_seconds),
                         format_pretty_bytes(load.host_to_device_bytes));
+    // Per-device VRAM ledger. At tp 2 the two ranks are NOT symmetric: `rank-only` is weight
+    // bytes that live on one rank alone (the DFlash2 draft model runs on rank 0 only), and KV
+    // capacity is sized by whichever rank has the least free memory after weights.
+    for (int rank = 0; rank < load.tp; ++rank) {
+        const DeviceMemoryReport& row = load.devices[static_cast<std::size_t>(rank)];
+        std::string weights = format_pretty_bytes(row.weights_bytes);
+        if (load.tp > 1) {
+            weights += " (sharded " + format_pretty_bytes(row.weights_sharded_bytes) +
+                       ", replicated " + format_pretty_bytes(row.weights_replicated_bytes) +
+                       ", rank-only " + format_pretty_bytes(row.weights_local_bytes) + ")";
+        }
+        const std::uint64_t runtime_bytes =
+            row.reserved_bytes > row.weights_bytes ? row.reserved_bytes - row.weights_bytes : 0;
+        impl_->logger->info(
+            "rank {} cuda:{} | weights {} | runtime {} (KV {}, graphs {}) | free {} of {}", rank,
+            row.device, weights, format_pretty_bytes(runtime_bytes),
+            format_pretty_bytes(row.kv_pool_bytes), format_pretty_bytes(row.cuda_graph_bytes),
+            format_pretty_bytes(row.free_after_startup_bytes), format_pretty_bytes(row.total_bytes));
+    }
+    if (load.tp == 2) {
+        const DeviceMemoryReport& a = load.devices[0];
+        const DeviceMemoryReport& b = load.devices[1];
+        if (a.weights_local_bytes != b.weights_local_bytes) {
+            const int heavier = a.weights_local_bytes > b.weights_local_bytes ? 0 : 1;
+            const std::uint64_t delta = heavier == 0 ? a.weights_local_bytes - b.weights_local_bytes
+                                                     : b.weights_local_bytes - a.weights_local_bytes;
+            impl_->logger->info(
+                "rank {} holds {} of rank-only weights the other rank does not; KV capacity is "
+                "bounded by the rank with the least free memory",
+                heavier, format_pretty_bytes(delta));
+        }
+    }
     impl_->logger->debug(
         "load detail | target {} | artifact read {} | H2D {} | staging peak {} | tensors {} | "
         "resources {}",

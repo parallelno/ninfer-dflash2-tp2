@@ -25,6 +25,13 @@ struct MaterializationStats {
     int device_count                      = 1;
     std::array<std::uint64_t, kMaximumDevices> per_device_h2d_bytes{};
     std::array<std::uint64_t, kMaximumDevices> per_device_capacity_bytes{};
+    // Why a device's arena is the size it is, by placement kind (planned bytes, excluding
+    // alignment padding). `sharded`: this device's slice of a split object. `replicated`: a whole
+    // object every device also holds. `local`: a whole object only THIS device holds (rank-0-only
+    // weights such as the DFlash2 draft model) -- the one component that differs between ranks.
+    std::array<std::uint64_t, kMaximumDevices> per_device_sharded_bytes{};
+    std::array<std::uint64_t, kMaximumDevices> per_device_replicated_bytes{};
+    std::array<std::uint64_t, kMaximumDevices> per_device_local_bytes{};
 };
 
 class MaterializedArtifact {

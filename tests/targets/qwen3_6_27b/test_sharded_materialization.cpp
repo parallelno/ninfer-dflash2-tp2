@@ -145,6 +145,7 @@ struct FamilyRow {
 std::uint64_t expected_shard_bytes(const ninfer::artifact::TensorDescriptor& tensor,
                                    const ShardMapping& mapping, int device) {
     if (mapping.axis == ShardAxis::Replicated) { return tensor.bytes; }
+    if (mapping.axis == ShardAxis::PrimaryOnly) { return device == 0 ? tensor.bytes : 0; }
     std::vector<ninfer::artifact::SliceRange> ranges;
     for (const Shard& shard : mapping.shards) {
         if (shard.device == device) { ranges.push_back({shard.row_begin, shard.row_count}); }
@@ -167,6 +168,8 @@ const char* axis_name(ShardAxis axis) {
         return "rows";
     case ShardAxis::Columns:
         return "columns";
+    case ShardAxis::PrimaryOnly:
+        return "primary-only";
     }
     return "?";
 }

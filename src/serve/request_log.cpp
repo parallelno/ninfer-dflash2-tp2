@@ -475,6 +475,24 @@ std::string format_server_start_json(
                                                           {"resource_count", load.resource_count},
                                                           {"load_seconds", load.load_seconds},
                                                           {"upload_seconds", load.upload_seconds}};
+    {
+        Json devices = Json::array();
+        for (int rank = 0; rank < load.tp; ++rank) {
+            const ninfer::DeviceMemoryReport& row = load.devices[static_cast<std::size_t>(rank)];
+            devices.push_back(Json{{"rank", rank},
+                                   {"device", row.device},
+                                   {"weights_bytes", row.weights_bytes},
+                                   {"weights_sharded_bytes", row.weights_sharded_bytes},
+                                   {"weights_replicated_bytes", row.weights_replicated_bytes},
+                                   {"weights_local_bytes", row.weights_local_bytes},
+                                   {"kv_pool_bytes", row.kv_pool_bytes},
+                                   {"cuda_graph_bytes", row.cuda_graph_bytes},
+                                   {"reserved_bytes", row.reserved_bytes},
+                                   {"free_after_startup_bytes", row.free_after_startup_bytes},
+                                   {"total_bytes", row.total_bytes}});
+        }
+        record["devices"] = std::move(devices);
+    }
     const ninfer::ContextCacheOptions& cache       = engine_options.context_cache;
     const ninfer::ContextCostSummary& context_cost = load.context_cost;
     const std::uint64_t total_device_state_slots =

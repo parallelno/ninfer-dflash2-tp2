@@ -205,6 +205,9 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
         DeviceMemoryReport& row = summary.devices[slot];
         row.device              = execution.dev[slot]->device;
         row.weights_bytes       = stats.per_device_capacity_bytes[slot];
+        row.weights_sharded_bytes    = stats.per_device_sharded_bytes[slot];
+        row.weights_replicated_bytes = stats.per_device_replicated_bytes[slot];
+        row.weights_local_bytes      = stats.per_device_local_bytes[slot];
         row.kv_pool_bytes       = memory.kv_payload_bytes;
         row.gdn_state_bytes     = memory.gdn_state_bytes;
         row.sequence_bytes      = memory.sequence.capacity_bytes;

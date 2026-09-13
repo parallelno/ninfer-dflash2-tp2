@@ -322,9 +322,11 @@ int main() {
                      std::to_string(static_cast<int>(mapping.axis)) + ", expected " +
                      std::to_string(static_cast<int>(expected)));
             }
-            if ((mapping.axis == ShardAxis::Replicated) != mapping.shards.empty()) {
+            const bool whole_object = mapping.axis == ShardAxis::Replicated ||
+                                      mapping.axis == ShardAxis::PrimaryOnly;
+            if (whole_object != mapping.shards.empty()) {
                 fail(std::string("axis ") + std::string(object) +
-                     ": replicated and empty-plan disagree");
+                     ": whole-object axis and empty-plan disagree");
             }
         };
         for (std::string_view object :
@@ -346,6 +348,14 @@ int main() {
              {"text/token_embedding", "text/final_norm", "text/layers/5/input_norm",
               "text/layers/3/gdn/norm", "mtp/hidden_norm", "text/draft_head_token_ids"}) {
             expect_axis(object, ShardAxis::Replicated);
+        }
+        // The DFlash2 draft model runs on rank 0 only, so its whole bundle lives there alone --
+        // including leaves whose names would otherwise match a text-family rule.
+        for (std::string_view object :
+             {"dflash2/feature_projection", "dflash2/layers/0/input_norm",
+              "dflash2/layers/0/mlp/gate_up", "dflash2/layers/4/attention/output",
+              "dflash2/candidate_selector/successor_codebook"}) {
+            expect_axis(object, ShardAxis::PrimaryOnly);
         }
         // tp == 1 degenerates the same way plan_for does, before any family check.
         if (shard_mapping_for("not/a/real/object", 1, config).axis != ShardAxis::Replicated) {
