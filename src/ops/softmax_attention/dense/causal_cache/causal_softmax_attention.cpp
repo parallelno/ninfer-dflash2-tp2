@@ -371,7 +371,11 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
         return width <= 8 ? CausalAttentionRoute::SmallT : CausalAttentionRoute::ChunkedSmallT;
     }
     if (q_heads == 12) {
-        return width <= 6 ? CausalAttentionRoute::SmallT : CausalAttentionRoute::ChunkedSmallT;
+        // tp2 shard: decode/verify widths keep the split-K small-T kernels (captured in the decode
+        // graphs); prefill-scale widths take the dense prompt kernel instead of ~T/6 chunks.
+        if (width <= 6) return CausalAttentionRoute::SmallT;
+        if (width <= kMaximumVerifyTokens) return CausalAttentionRoute::ChunkedSmallT;
+        return CausalAttentionRoute::Prompt;
     }
     if (width <= 6) return CausalAttentionRoute::SmallT;
     if (batch_size > 1) return CausalAttentionRoute::ChunkedSmallT;
