@@ -4,7 +4,7 @@ param(
     [int]$MaxTokens = 512,
     [int]$Repeats = 2,
     [int]$Chars = 26000,
-    [string]$Corpus = 'ninfer-dflash2-tp2-port\eval\corpora\perplexity-1m\data\pg19\00.txt'
+    [string]$Corpus = (Join-Path (Split-Path -Parent $PSScriptRoot) 'eval\corpora\perplexity-1m\data\pg19\00.txt')
 )
 
 $ErrorActionPreference = 'Stop'

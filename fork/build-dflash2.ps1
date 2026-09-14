@@ -1,11 +1,11 @@
 param(
-    [string]$VcpkgRoot = (Join-Path $PSScriptRoot 'third_party\vcpkg'),
+    [string]$VcpkgRoot = (Join-Path (Split-Path -Parent $PSScriptRoot) 'third_party\vcpkg'),
     [int]$Parallel = 8
 )
 
 $ErrorActionPreference = 'Stop'
 
-$repo = Join-Path $PSScriptRoot 'ninfer-dflash2-tp2-port'
+$repo = Split-Path -Parent $PSScriptRoot
 $vcpkg = Join-Path $VcpkgRoot 'vcpkg.exe'
 $pkgConfig = Join-Path $VcpkgRoot 'installed\x64-windows\tools\pkgconf\pkgconf.exe'
 $cudaCompiler = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4\bin\nvcc.exe'

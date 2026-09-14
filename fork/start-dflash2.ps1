@@ -9,16 +9,16 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$repo = Join-Path $PSScriptRoot 'ninfer-dflash2-tp2-port'
+$repo = Split-Path -Parent $PSScriptRoot
 $server = Join-Path $repo 'build-tp2-check\apps\ninfer-serve.exe'
-$model = Join-Path $PSScriptRoot 'model\qwen3_8_27b_nvfp4.dflash2.ninfer'
+$model = Join-Path $repo 'model\qwen3_8_27b_nvfp4.dflash2.ninfer'
 
 if ($Devices.Count -ne 2) {
     throw '-Devices must contain exactly two CUDA device ids.'
 }
 
 if (-not (Test-Path -LiteralPath $server -PathType Leaf)) {
-    throw "NInfer server was not found: $server. Build ninfer-dflash2-tp2-port\\build-tp2-check first."
+    throw "NInfer server was not found: $server. Build build-tp2-check in the repository root first."
 }
 
 if (-not (Test-Path -LiteralPath $model -PathType Leaf)) {

@@ -17,11 +17,11 @@ Paths
 - Build:
   C:\Work\Programming\ninfer_DFlash2_setup\ninfer-dflash2-tp2-port\build-tp2-check
 - Model:
-  C:\Work\Programming\ninfer_DFlash2_setup\model\qwen3_8_27b_nvfp4.dflash2.ninfer
+  C:\Work\Programming\ninfer_DFlash2_setup\ninfer-dflash2-tp2-port\model\qwen3_8_27b_nvfp4.dflash2.ninfer
 - Launcher:
-  C:\Work\Programming\ninfer_DFlash2_setup\start-dflash2.ps1
+  C:\Work\Programming\ninfer_DFlash2_setup\ninfer-dflash2-tp2-port\fork\start-dflash2.ps1
 - API test:
-  C:\Work\Programming\ninfer_DFlash2_setup\test-dflash2.ps1
+  C:\Work\Programming\ninfer_DFlash2_setup\ninfer-dflash2-tp2-port\fork\test-dflash2.ps1
 - Performance/reference repository:
   C:\Work\Programming\ninfer_setup
 
@@ -84,7 +84,7 @@ Current runtime result
 - The same corruption occurs with --draft-tokens 4 and --draft-tokens 1.
 - Therefore the newly added T=5 GDN specialization is not uniquely responsible.
 - The first emitted token is likely already wrong during TP2 prompt prefill, before speculative decode.
-- start-dflash2.ps1 currently declares `[switch]$NoCudaGraph = $true` and therefore appends
+- start-dflash2.ps1 (fork\start-dflash2.ps1) currently declares `[switch]$NoCudaGraph = $true` and therefore appends
   `--no-cuda-graph` by default. This is temporary. Do not treat it as an accepted final setting.
 
 Controls attempted
@@ -158,12 +158,12 @@ Likely build command approach
 Validation
 1. Build ninfer-serve successfully.
 2. Start:
-   & C:\Work\Programming\ninfer_DFlash2_setup\start-dflash2.ps1
+   & C:\Work\Programming\ninfer_DFlash2_setup\ninfer-dflash2-tp2-port\fork\start-dflash2.ps1
 3. Wait for:
    warmup complete
    listening on http://127.0.0.1:30001
 4. Run:
-   & C:\Work\Programming\ninfer_DFlash2_setup\test-dflash2.ps1 -Port 30001
+   & C:\Work\Programming\ninfer_DFlash2_setup\ninfer-dflash2-tp2-port\fork\test-dflash2.ps1 -Port 30001
 5. The expected content is:
    NInfer DFlash2 is ready.
 6. Do not consider health-only or repeated punctuation a pass.
@@ -183,4 +183,4 @@ Repository safety
   https://github.com/parallelno/ninfer-dflash2-tp2.git
 - Do not commit or push unless requested.
 - Preserve user changes, especially the CMake split-compile default of 20.
-- Keep the 22.6 GB model and generated artifacts out of Git.
+- Keep the 22.6 GB model (model\ at the repository root, git-ignored) and generated artifacts out of Git.

@@ -4,7 +4,7 @@ param(
     [int]$MaxTokens = 512,
     [int]$Chars = 26000,
     [int]$SampleMs = 100,
-    [string]$Corpus = 'ninfer-dflash2-tp2-port\eval\corpora\perplexity-1m\data\pg19\00.txt'
+    [string]$Corpus = (Join-Path (Split-Path -Parent $PSScriptRoot) 'eval\corpora\perplexity-1m\data\pg19\00.txt')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,7 +21,8 @@ $body = @{
 } | ConvertTo-Json -Depth 5
 
 # Sample both GPUs while the request runs; CSV rows: timestamp, index, util.gpu, util.mem, power, clocks.sm
-$csv = Join-Path $PSScriptRoot 'temp\gpu_util.csv'
+$csv = Join-Path (Split-Path -Parent $PSScriptRoot) 'temp\gpu_util.csv'
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $csv) | Out-Null
 if (Test-Path $csv) { Remove-Item $csv }
 $sampler = Start-Process -FilePath nvidia-smi -ArgumentList @(
     '--query-gpu=timestamp,index,utilization.gpu,utilization.memory,power.draw,clocks.sm,pcie.link.gen.current',

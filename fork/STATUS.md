@@ -5,11 +5,15 @@
 `ninfer-dflash2-tp2-port` serves Qwen3.8-27B NVFP4 with `--spec dflash2 --tp 2` across two
 RTX 5060 Ti 16 GB GPUs (no P2P; PeerMailbox collectives), CUDA graphs on by default.
 
-- `.\start-dflash2.ps1` -> `listening on http://127.0.0.1:30001` in ~65-80 s (weights ~55-73 s,
+The helper scripts and this document live in `fork/` inside the repository; the model artifact
+lives in `model/` at the repository root (git-ignored). All paths below are relative to the
+repository root unless stated otherwise.
+
+- `.\fork\start-dflash2.ps1` -> `listening on http://127.0.0.1:30001` in ~65-80 s (weights ~55-73 s,
   graph capture ~4.5 s, warmup ~0.3 s). `-NoCudaGraph` is the eager escape hatch (warmup ~4.6 s).
-- `.\test-dflash2.ps1 -Port 30001` -> `/health` ok and chat reply `NInfer DFlash2 is ready.`
-- `.\temp\determinism.ps1 -Runs 4` (200-token Fibonacci prompt, temperature 0) -> 4/4 identical.
-- `.\bench-dflash2.ps1` (4 prompts x 256 tokens x 2 rounds) -> identical SHA per prompt across
+- `.\fork\test-dflash2.ps1 -Port 30001` -> `/health` ok and chat reply `NInfer DFlash2 is ready.`
+- `determinism.ps1 -Runs 4` (200-token Fibonacci prompt, temperature 0; kept outside the repo) -> 4/4 identical.
+- `.\fork\bench-dflash2.ps1` (4 prompts x 256 tokens x 2 rounds) -> identical SHA per prompt across
   rounds.
 
 ## Fixes in this fork
@@ -29,7 +33,7 @@ RTX 5060 Ti 16 GB GPUs (no P2P; PeerMailbox collectives), CUDA graphs on by defa
   2054-8198 keys, TokenTile>=6) with the default 48 KiB limit -> `cudaErrorInvalidValue` on any
   prompt longer than ~2K tokens. Now set per device.
 - `tests/CMakeLists.txt`: removed duplicate `ninfer_cli_options_test` target.
-- `start-dflash2.ps1`: CUDA graphs on by default, `[switch]$NoCudaGraph`; `--draft-tokens 4`.
+- `fork/start-dflash2.ps1`: CUDA graphs on by default, `[switch]$NoCudaGraph`; `--draft-tokens 4`.
 - **Prefill attention route.**
   `src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp`
   (`causal_attention_resolve_route`): the TP2 port's rule for the sharded head count
@@ -56,14 +60,14 @@ RTX 5060 Ti 16 GB GPUs (no P2P; PeerMailbox collectives), CUDA graphs on by defa
   plus a note on which rank carries rank-only weights, so it is obvious why rank 0 uses more
   memory and which GPU bounds the KV pool. The `server_start` JSONL record gets a `devices` array
   with the same fields.
-- `start-dflash2.ps1`: `--kv-capacity` defaults to `-MaxContext` instead of `auto` (auto keeps a
+- `fork/start-dflash2.ps1`: `--kv-capacity` defaults to `-MaxContext` instead of `auto` (auto keeps a
   1 GiB headroom that blocked 16K on 16 GB cards; `-KvCapacity` still overrides).
 
 ## Benchmark vs reference (`C:\Work\Programming\ninfer_setup\start-ninfer.ps1`, MTP, graphs on)
 
 Both servers started with the reference launcher's settings (`--tp 2 --devices 0,1 --kv-dtype int8
 --max-concurrency 1 --draft-tokens 4 --lm-head-draft`) and benchmarked back to back with
-`bench-dflash2.ps1` (same 4 prompts, max 256 tokens, 2 rounds, single client). The reference runs
+`fork/bench-dflash2.ps1` (same 4 prompts, max 256 tokens, 2 rounds, single client). The reference runs
 `--max-context 32768`; the 25.0 GiB DFlash2 artifact (vs 20.9 GiB MTP artifact) does not leave
 room for that, so the fork ran `--max-context 8192` (startup fails at 32768: runtime reservation).
 
@@ -85,7 +89,7 @@ reference's 67.2 aggregate because of TTFT.
 
 ### Long context (~6.6K-token prompt in an 8K window)
 
-`bench-long.ps1`: both servers at `--max-context 8192`, one 26,000-char excerpt of
+`fork/bench-long.ps1`: both servers at `--max-context 8192`, one 26,000-char excerpt of
 `eval/corpora/perplexity-1m/data/pg19/00.txt` (6,582 prompt tokens), two tasks, max 512 output
 tokens, 2 rounds. Server-side numbers:
 
@@ -112,7 +116,7 @@ acceptance on prose. Short-prompt TTFT is unchanged (~450 ms vs reference ~280 m
 Same bench with `-Chars 57000` (14,632 prompt tokens). The fork cannot start with
 `--max-context 16384 --kv-capacity auto` (needs 1.16 GB runtime + 1 GiB automatic headroom, only
 2.11 GB free after the 25 GiB weights); `--kv-capacity 16384` (explicit, no headroom) works
-(`start-dflash2.ps1 -MaxContext 16384 -KvCapacity 16384`, 1.59 GiB free after startup). Reference
+(`fork/start-dflash2.ps1 -MaxContext 16384 -KvCapacity 16384`, 1.59 GiB free after startup). Reference
 ran `start-ninfer.ps1 -MaxContext 16384`.
 
 | task | reference MTP: TTFT / prefill / decode | fork DFlash2: TTFT / prefill / decode |
@@ -145,7 +149,7 @@ Same decode cost per forward pass, so the TP2 layer schedule, collectives and CU
 loop are as fast as the reference. Build config is identical too (Release, `sm_120a`, same
 nvcc/MSVC flags).
 
-**2. GPU utilization is the same.** `gpu-util.ps1` (nvidia-smi, 100 ms samples, DFlash2 K=7):
+**2. GPU utilization is the same.** `fork/gpu-util.ps1` (nvidia-smi, 100 ms samples, DFlash2 K=7):
 fork decode GPU0 90.4% / GPU1 79.4% (min 27/34%), prefill 73-75%; reference decode 90.9% /
 91.5% (min 82/85%), prefill 72-74%. Rank 1 idles briefly each round in the fork (rank 0 alone
 runs the DFlash2 draft head, rank 1 waits for the drafts), but the per-round wall time is the
@@ -200,14 +204,15 @@ TTFT on short prompts (450 vs 280 ms).
 
 ## Housekeeping
 
-- Model artifact stays in `model/` (git-ignored); never delete `ninfer-upstream\.git`.
+- Model artifact stays in `model/` at the repository root (git-ignored via `*.ninfer`); helper
+  scripts and docs stay in `fork/`; never delete `ninfer-upstream\.git`.
 
 ## Upstream notes
 
 `ninfer-upstream` is a current upstream checkout at `d49296868dcc17bd478ec185f0d3a801bcc0bf56`.
 It contains the Qwen3.8-27B DFlash2 artifact reader and supports `--spec dflash2 --draft-tokens 7`.
 
-Run `./build-dflash2.ps1` to provision the MSVC dependency set through vcpkg and build
+Run `./fork/build-dflash2.ps1` to provision the MSVC dependency set through vcpkg and build
 `ninfer-serve.exe` for CUDA `sm_120a`.
 
 This upstream supports one CUDA device only (no `--tp`/`--devices`) and cannot load the 23.7 GB
