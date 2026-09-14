@@ -1,0 +1,186 @@
+You are taking over a Windows CUDA/C++ debugging task. Work autonomously until TP2 + DFlash2 produces correct text, not merely a healthy server.
+
+Goal
+- Make NInfer serve Qwen3.8-27B NVFP4 with DFlash2 and tensor parallelism across two RTX 5060 Ti 16 GB GPUs.
+- Validate startup, warmup, /health, and deterministic chat output.
+- The final objective is not merely functional support: this fork must outperform the reference
+  NInfer setup at C:\Work\Programming\ninfer_setup on representative generation workloads.
+- Restore and validate CUDA graph execution after correctness is established. The current
+  `--no-cuda-graph` setting is temporary debugging scaffolding, not intended final behavior.
+- Do not commit or push unless explicitly requested.
+
+Paths
+- Workspace:
+  C:\Work\Programming\ninfer_DFlash2_setup
+- Repository:
+  C:\Work\Programming\ninfer_DFlash2_setup\ninfer-dflash2-tp2-port
+- Build:
+  C:\Work\Programming\ninfer_DFlash2_setup\ninfer-dflash2-tp2-port\build-tp2-check
+- Model:
+  C:\Work\Programming\ninfer_DFlash2_setup\model\qwen3_8_27b_nvfp4.dflash2.ninfer
+- Launcher:
+  C:\Work\Programming\ninfer_DFlash2_setup\start-dflash2.ps1
+- API test:
+  C:\Work\Programming\ninfer_DFlash2_setup\test-dflash2.ps1
+- Performance/reference repository:
+  C:\Work\Programming\ninfer_setup
+
+Performance intent and CUDA graphs
+- C:\Work\Programming\ninfer_setup is the performance baseline. Inspect its launcher, graph
+  configuration, benchmark procedure, and relevant runtime defaults before declaring this task
+  complete.
+- The reference setup enables CUDA graphs by default. This fork currently disables them only
+  because TP2 + DFlash2 is still under active correctness debugging.
+- Do not preserve eager-only execution as a design decision. Once eager TP2 + DFlash2 produces
+  correct tokens, enable CUDA graphs by default in start-dflash2.ps1 and fix graph capture/replay
+  defects that appear.
+- Keep `--no-cuda-graph` available only as a troubleshooting escape hatch, matching the intended
+  runtime semantics described by the CLI.
+- Correctness comes first: compare eager and graph-enabled output for the same deterministic
+  prompts and require equivalent valid text before benchmarking.
+- Benchmark this fork and C:\Work\Programming\ninfer_setup under comparable conditions: same
+  model or an equivalent supported model, prompt/input tokens, output-token budget, sampling,
+  KV dtype, warmup, and measurement boundaries. Record TTFT, prefill throughput, decode throughput,
+  total latency, and DFlash2 acceptance where available.
+- Do not claim success from theoretical TP2 scaling or one noisy run. Use warm runs and report the
+  exact commands/configurations and repeatable measurements.
+- Final success requires correct TP2 + DFlash2 output, stable CUDA graph capture/replay, and measured
+  performance better than the reference setup. If hardware/model differences prevent a strict
+  apples-to-apples comparison, document the limitation and use the closest defensible comparison.
+
+Environment
+- Windows 11 PowerShell
+- Visual Studio 2022 Community
+- CUDA 13.4
+- CMake 4.3.1
+- Ninja
+- CUDA architecture sm_120a
+- Two RTX 5060 Ti 16 GB GPUs without P2P
+- 32 logical processors
+
+Local Python
+- Do not install global Python packages or modify system PATH.
+- Portable Python 3.13.15:
+  <repo>\.python
+- Virtual environment:
+  <repo>\.venv
+- Interpreter:
+  <repo>\.venv\Scripts\python.exe
+- Local uv:
+  <repo>\.tools\uv\uv.exe
+- Local cache:
+  <repo>\.uv-cache
+- These directories are ignored by Git.
+- A user-profile python3.13.exe shim was removed; do not recreate it.
+
+Current runtime result
+- TP2 + DFlash2 loads 25.0 GiB of weights.
+- Engine initializes with 1.82 GiB free.
+- Warmup completes.
+- /health returns {"status":"ok"}.
+- Chat requests complete, but output is numerically wrong:
+  "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+- The request reports DFlash2 acceptance of 100%, e.g. 24/24 or 15/15.
+- The same corruption occurs with --draft-tokens 4 and --draft-tokens 1.
+- Therefore the newly added T=5 GDN specialization is not uniquely responsible.
+- The first emitted token is likely already wrong during TP2 prompt prefill, before speculative decode.
+- start-dflash2.ps1 currently declares `[switch]$NoCudaGraph = $true` and therefore appends
+  `--no-cuda-graph` by default. This is temporary. Do not treat it as an accepted final setting.
+
+Controls attempted
+- TP2 without speculation fails warmup:
+  gdn_gating_proj: unsupported ab_weight geometry
+- TP2 with MTP fails warmup:
+  sequence has no peer MTP KV allocation
+- Therefore neither currently provides a numerical baseline.
+
+Important implemented fixes
+- TP execution propagated into text prefill.
+- DFlash feature capture connected to TP2 layer execution.
+- Rank-local GDN state and primary-device arena binding fixed.
+- TP2 convolution and Q12/KV2 attention routes added.
+- Q12 attention uses chunked small-T.
+- TP2 FP8 GDN small-T dispatch supports T=2 through T=10.
+- TP2 FP8 vocabulary shape [124160,5120] was routed to A16 small-T.
+- Optimized draft head [131072,5120] is replicated, as is its token-ID map.
+- CUDA compilation uses configurable --split-compile; preserve the source default of 20.
+
+Primary diagnostic hypothesis
+- TP2 prefill calls TextContext::logits_tp2.
+- It computes two [124160,T] output-head shards, gathers them into [248320,T], then samples on rank 0.
+- The first generated token appears to be token ID 0 ("!"), suggesting the TP2 FP8 vocabulary projection, output-head shard materialization/order, allgather, or prefill logits destination is wrong.
+- Inspect this path before blaming DFlash candidate selection.
+
+Key files
+- src/targets/qwen3_6/impl/runtime/text_context_impl.h
+  - TextContext::logits_tp2
+  - TextContext::prefill_impl_tp2
+  - TextContext::target_verify_batch
+  - TextContext::proposal_argmax_tp2
+- src/targets/qwen3_6/impl/runtime/dflash_impl.h
+- src/targets/qwen3_6/impl/runtime/speculative_target_impl.h
+- src/targets/qwen3_6_27b/impl/load/bindings.cpp
+- src/ops/linear/fp8/fp8_dispatch.cpp
+- src/ops/linear/fp8/fp8_a16_small_t_mma.cu
+- src/ops/common/allreduce.cu
+- tests/ops/test_output_head_split.cpp
+- tests/ops/test_allreduce.cpp
+- tools/tp2/parity.cpp
+
+Testing complication
+- tests/ops/test_output_head_split.cpp and test_allreduce.cpp exist but are not registered in tests/CMakeLists.txt.
+- BUILD_TESTING=ON currently fails because tests/CMakeLists.txt defines ninfer_cli_options_test twice.
+- Temporary registrations for those two tests were removed.
+- Fix or bypass the duplicate target cleanly if those tests are needed.
+
+Build issue introduced during reconfiguration
+- build-tp2-check was successfully restored to BUILD_TESTING=OFF, but CMake regeneration caused many CUDA objects to rebuild.
+- nvcc currently reports:
+  'cl.exe' is not recognized as an internal or external command
+- Launch-VsDevShell.ps1 did not make cl.exe visible to nvcc’s child process in recent attempts.
+- --compiler-bindir was present in the nvcc command but nvcc still attempted plain cl.exe.
+- Resolve this environment issue before further builds.
+- A reliable option may be launching through VsDevCmd.bat using cmd.exe /c so PATH, INCLUDE, and LIB are inherited by Ninja/nvcc.
+- Do not delete the build directory unless necessary.
+
+Likely build command approach
+1. Locate VS:
+   ${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe
+2. Locate:
+   <VS>\Common7\Tools\VsDevCmd.bat
+3. Run CMake/Ninja inside the same cmd.exe process initialized by VsDevCmd.bat.
+4. Preserve:
+   - BUILD_TESTING=OFF unless intentionally fixing test CMake
+   - Python3_EXECUTABLE=<repo>\.venv\Scripts\python.exe
+   - --parallel 4
+   - existing CUDA architecture and split-compile settings
+
+Validation
+1. Build ninfer-serve successfully.
+2. Start:
+   & C:\Work\Programming\ninfer_DFlash2_setup\start-dflash2.ps1
+3. Wait for:
+   warmup complete
+   listening on http://127.0.0.1:30001
+4. Run:
+   & C:\Work\Programming\ninfer_DFlash2_setup\test-dflash2.ps1 -Port 30001
+5. The expected content is:
+   NInfer DFlash2 is ready.
+6. Do not consider health-only or repeated punctuation a pass.
+7. After eager correctness passes, restore CUDA graphs as the launcher default and repeat warmup,
+  health, deterministic chat, and repeated-request testing with graphs enabled.
+8. Verify the eager escape hatch still works and produces valid output when explicitly selected.
+9. Run comparable warm benchmarks against C:\Work\Programming\ninfer_setup and report whether this
+  fork is faster, including TTFT, prefill tok/s, decode tok/s, and total latency.
+10. Finish with:
+   git status --short
+   git diff --check
+
+Repository safety
+- Never delete ninfer-upstream\.git.
+- Never push upstream.
+- Only the personal remote is allowed:
+  https://github.com/parallelno/ninfer-dflash2-tp2.git
+- Do not commit or push unless requested.
+- Preserve user changes, especially the CMake split-compile default of 20.
+- Keep the 22.6 GB model and generated artifacts out of Git.

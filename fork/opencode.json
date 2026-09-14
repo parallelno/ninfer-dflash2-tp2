@@ -1,0 +1,27 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "local/qwen-local-dflash2",
+  "provider": {
+    "local": {
+      "options": {
+        "baseURL": "http://127.0.0.1:30001/v1",
+        "apiKey": "dummy"
+      },
+      "models": {
+        "qwen-local-dflash2": {
+          "variants": {
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "medium": {
+              "reasoningEffort": "medium"
+            },
+            "xhigh": {
+              "reasoningEffort": "xhigh"
+            }
+          }
+        }
+      }
+    }
+  }
+}
