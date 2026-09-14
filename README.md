@@ -1,4 +1,83 @@
-# NInfer
+# NInfer — DFlash2 on Windows 11 TP2 fork
+
+> Qwen3.8-27B NVFP4 with DFlash2 speculative decoding, tensor-parallel across two consumer
+> GeForce GPUs on native Windows 11 — measured on 2 × RTX 5060 Ti 16 GB, no CUDA P2P, no NCCL,
+> no WSL2 or Docker.
+
+> **This is the DFlash2-TP2 fork** ([parallelno/ninfer-dflash2-tp2](https://github.com/parallelno/ninfer-dflash2-tp2)).
+> It descends from [ivanov84/ninfer-windows-tp2](https://github.com/ivanov84/ninfer-windows-tp2)
+> (native Windows TP2 with the pinned-host peer-mailbox transport), which in turn builds on
+> [wamansou/ninfer-tp2-1m](https://github.com/wamansou/ninfer-tp2-1m),
+> [natpate/ninfer-windows](https://github.com/natpate/ninfer-windows), and upstream
+> [Neroued/ninfer](https://github.com/Neroued/ninfer). See [NOTICE](NOTICE) for attribution.
+>
+> What this fork adds:
+>
+> - **`--spec dflash2` under `--tp 2`.** The DFlash2 draft model runs on rank 0 only
+>   (`artifact::ShardAxis::PrimaryOnly`); rank 1 receives drafts by memcpy, saving ~2 GiB on the
+>   second GPU. CUDA graphs are on by default; `--no-cuda-graph` is the eager escape hatch.
+> - **TP2 correctness fixes** that also affect MTP: per-plane shard copies in
+>   `src/artifact/materializer.cpp` (the merged upstream loop gave every shard the first N bytes
+>   of the full tensor → NaN), mirrored rank-1 KV page tables / StateImage slots (deterministic
+>   output at tp2), host state/KV tiers default to 0 at `--tp 2`, and per-device
+>   `cudaFuncSetAttribute(MaxDynamicSharedMemorySize)` in the attention kernels (was set once
+>   per process → `cudaErrorInvalidValue` on rank 1 for prompts longer than ~2K tokens).
+> - **Prefill routing fix**: 12-head prompts no longer run as 6-token decode launches
+>   (`causal_softmax_attention.cpp`), prefill 1.13K → 1.35K tok/s on the test hardware.
+> - **Per-rank startup memory report**: weights sharded/replicated/rank-only, KV, graphs, free;
+>   also emitted as a `devices` array in the `server_start` JSONL record.
+> - **Windows helper scripts and status docs in [`fork/`](fork/)**: `build-dflash2.ps1`,
+>   `start-dflash2.ps1`, `test-dflash2.ps1`, `bench-dflash2.ps1`, `bench-long.ps1`,
+>   `gpu-util.ps1`, plus [fork/STATUS.md](fork/STATUS.md) (fixes, known issues, measurements) and
+>   [fork/BENCHMARKS.md](fork/BENCHMARKS.md) (agent-workflow comparison against the MTP reference).
+>
+> Everything below this fork section is the upstream README; the single-RTX-5090 / Linux
+> statements describe upstream's product boundary, not this fork's tested configuration.
+
+## Fork quick start (Windows 11, two GPUs)
+
+Requirements: Windows 11 x64, Visual Studio 2022 (Desktop C++), CMake 3.28+, Ninja, CUDA
+Toolkit 13.4 (`sm_120a`), two Blackwell GeForce GPUs (tested: 2 × RTX 5060 Ti 16 GB; the Windows
+display GPU has ~1.2 GB less free memory and bounds KV capacity), and vcpkg for FFmpeg/libcurl.
+
+Build (the CUDA compiler needs `cl.exe` on `PATH`; `VsDevCmd.bat` provides it):
+
+```powershell
+cmd /c """C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat"" -arch=amd64 -host_arch=amd64 -no_logo && cmake -S . -B build-tp2-check -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF && cmake --build build-tp2-check --target ninfer-serve --parallel 4"
+```
+
+`fork/build-dflash2.ps1` is the one-shot alternative that also bootstraps vcpkg and its
+dependency set. Place the Qwen3.8-27B NVFP4 artifact with DFlash2 companion weights (see the
+[model card](model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md)) at
+`model\qwen3_8_27b_nvfp4.dflash2.ninfer` (git-ignored), then:
+
+```powershell
+.\fork\start-dflash2.ps1                     # tp2, dflash2, K=4, graphs on, port 30000
+.\fork\start-dflash2.ps1 -DraftTokens 7      # K=7 (higher acceptance on code/structured output)
+.\fork\start-dflash2.ps1 -NoCudaGraph        # eager fallback
+.\fork\test-dflash2.ps1 -Port 30000          # /health + deterministic chat smoke test
+```
+
+The launcher expands to:
+
+```powershell
+build-tp2-check\apps\ninfer-serve.exe model\qwen3_8_27b_nvfp4.dflash2.ninfer `
+  --host 127.0.0.1 --port 30000 --model-id qwen-local `
+  --tp 2 --devices 0,1 --max-context 32768 --kv-capacity 32768 --kv-dtype int8 `
+  --max-concurrency 1 --spec dflash2 --draft-tokens 4 --lm-head-draft
+```
+
+`--kv-capacity` is passed explicitly because `auto` keeps 1 GiB of headroom that does not fit
+alongside the 25 GiB DFlash2 artifact on two 16 GB cards. Startup takes ~65-80 s (weights
+~55-73 s, graph capture ~4.5 s). Measured against the MTP reference fork on the same hardware
+(`fork/bench-dflash2.ps1`, 4 prompts x 256 tokens): the reference averages ~67 tok/s decode; this
+fork ranges 53-113 tok/s depending on DFlash2 draft acceptance (31%-96%) — ahead on code and
+structured output, behind on free-form prose. Prefill is ~4% slower and short-prompt TTFT ~170 ms
+higher. Details and the long-context run are in [fork/STATUS.md](fork/STATUS.md).
+
+---
+
+# NInfer (upstream README)
 
 > Selected checkpoints. Maximum single-GPU inference performance.
 
