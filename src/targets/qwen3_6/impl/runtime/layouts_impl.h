@@ -855,6 +855,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                         const std::uint64_t final_visible = std::min<std::uint64_t>(
                             impl->capacity,
                             static_cast<std::uint64_t>(profile.max) + impl->draft_window + 1ULL);
+                        // tp 2 measured on 2x RTX 5060 Ti (89.5K context, K=4, 5 classes):
+                        // 22 MiB rank 0 / 41 MiB rank 1 total, i.e. ~8 MiB per class; 24 MiB
+                        // covers 3x that plus the ~20 MiB one-shot module-load transient.
+                        if (impl->tp == 2) { return 24ULL * kMiB; }
                         return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
                     },
                     "DFlash graph allowance");

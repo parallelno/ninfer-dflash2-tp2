@@ -1,6 +1,7 @@
 param(
     [int]$Port = 30000,
-    [int]$MaxContext = 89856,
+    # preflight reports ~110.7K as the ceiling on rank 0 (16 GB) with the 24 MiB/class tp2 graph allowance
+    [int]$MaxContext = 110000,
     [int]$DraftTokens = 4,
     [int]$KvCapacity = 0,
     [int[]]$Devices = @(0, 1),
