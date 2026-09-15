@@ -684,6 +684,9 @@ public:
     const std::size_t graph_allowance_bytes;
     const WorkspacePlan workspace_plan;
     std::size_t graph_node_count = 0;
+    // Drop in free device memory across prepare_graphs(), per device; 0 when graphs are disabled.
+    std::size_t graph_observed_bytes      = 0;
+    std::size_t graph_peer_observed_bytes = 0;
 
     DeviceArena persistent;
     DeviceArena workspace_storage;

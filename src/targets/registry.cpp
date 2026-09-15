@@ -8,8 +8,10 @@
 #include "runtime/engine/kv_capacity.h"
 #include "runtime/engine/context_cost.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -109,6 +111,70 @@ std::size_t current_total_device_bytes(int device) {
     return total_bytes;
 }
 
+std::string mib(std::size_t bytes) {
+    return std::to_string((bytes + (1ULL << 20) - 1) >> 20) + " MiB";
+}
+
+// Appends a per-device memory ledger and the largest context that would fit to a capacity
+// planning failure, so the operator can size --max-context / --kv-capacity without loading weights.
+// `reservation_at(max_context)` re-plans the minimum reservation for a different context so the
+// slope covers every context-dependent buffer, not only the KV pages.
+template <class ReservationAt>
+std::string describe_capacity_failure(std::string_view what, const EngineOptions& options,
+                                      const ExecutionContext& execution,
+                                      std::span<const std::uint64_t> planned_weight_bytes,
+                                      std::span<const std::size_t> runtime_budget_bytes,
+                                      const runtime::SequenceCapacityCurve& curve,
+                                      ReservationAt&& reservation_at) {
+    std::string out(what);
+    std::size_t bottleneck = 0;
+    for (std::size_t rank = 0; rank < runtime_budget_bytes.size(); ++rank) {
+        const std::size_t free_bytes =
+            runtime_budget_bytes[rank] + static_cast<std::size_t>(planned_weight_bytes[rank]);
+        out += " | rank " + std::to_string(rank) + " cuda:" +
+               std::to_string(execution.dev[rank]->device) + ": free " + mib(free_bytes) +
+               ", weights " + mib(static_cast<std::size_t>(planned_weight_bytes[rank])) +
+               ", left for runtime " + mib(runtime_budget_bytes[rank]);
+        if (runtime_budget_bytes[rank] < runtime_budget_bytes[bottleneck]) { bottleneck = rank; }
+    }
+    const std::size_t headroom = options.kv_capacity.automatic_headroom_bytes;
+    const std::size_t budget =
+        runtime_budget_bytes[bottleneck] >= headroom ? runtime_budget_bytes[bottleneck] - headroom : 0;
+    out += " | runtime needs " + mib(curve.minimum_device_reservation_bytes) + " at max_context " +
+           std::to_string(options.max_context);
+    if (headroom != 0) { out += " + " + mib(headroom) + " automatic headroom"; }
+
+    const std::uint32_t page_tokens = curve.main_page_tokens;
+    std::size_t bytes_per_page      = curve.bytes_per_additional_main_page_group;
+    if (bytes_per_page == 0 && options.max_context > page_tokens) {
+        const std::size_t smaller = reservation_at(options.max_context - page_tokens);
+        if (smaller < curve.minimum_device_reservation_bytes) {
+            bytes_per_page = curve.minimum_device_reservation_bytes - smaller;
+        }
+    }
+    if (bytes_per_page == 0) { return out; }
+    out += " (" + mib(bytes_per_page) + " per " + std::to_string(page_tokens) + " tokens)";
+
+    if (budget >= curve.minimum_device_reservation_bytes) {
+        std::uint64_t pages = curve.minimum_main_page_groups +
+                              (budget - curve.minimum_device_reservation_bytes) / bytes_per_page;
+        pages = std::min<std::uint64_t>(pages, curve.maximum_main_page_groups);
+        out += " | largest --kv-capacity that fits rank " + std::to_string(bottleneck) + ": " +
+               std::to_string(pages * page_tokens) + " tokens";
+    } else {
+        const std::size_t deficit    = curve.minimum_device_reservation_bytes - budget;
+        const std::size_t pages_over = (deficit + bytes_per_page - 1) / bytes_per_page;
+        const std::uint64_t fit_pages =
+            static_cast<std::uint64_t>(curve.minimum_main_page_groups) > pages_over
+                ? curve.minimum_main_page_groups - pages_over
+                : 0;
+        out += " | rank " + std::to_string(bottleneck) + " is " + mib(deficit) +
+               " short; --max-context up to about " + std::to_string(fit_pages * page_tokens) +
+               " tokens would fit";
+    }
+    return out;
+}
+
 template <class Target, class Loaded, class Instance>
 ConstructedTarget construct_registered(const EngineOptions& options, ExecutionContext& execution,
                                        artifact::Reader& reader, Clock::time_point load_start,
@@ -143,8 +209,27 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
             execution.dev[slot]->device,
             load_plan.materialization().device_capacity_bytes[slot]));
     }
-    (void)runtime::resolve_kv_capacity_symmetric(options.kv_capacity, curve,
-                                                  preflight_runtime_bytes);
+    try {
+        (void)runtime::resolve_kv_capacity_symmetric(options.kv_capacity, curve,
+                                                      preflight_runtime_bytes);
+    } catch (const std::invalid_argument& error) {
+        const auto reservation_at = [&](std::uint32_t max_context) -> std::size_t {
+            EngineOptions smaller = options;
+            smaller.max_context   = max_context;
+            if (smaller.kv_capacity.mode == KvCapacityMode::Explicit) {
+                smaller.kv_capacity.explicit_tokens =
+                    std::min(smaller.kv_capacity.explicit_tokens, max_context);
+            }
+            return Target::make_sequence_planner(device, smaller, weights_profile)
+                .capacity_curve()
+                .minimum_device_reservation_bytes;
+        };
+        throw std::invalid_argument(describe_capacity_failure(
+            error.what(), options, execution,
+            std::span<const std::uint64_t>(load_plan.materialization().device_capacity_bytes.data(),
+                                           static_cast<std::size_t>(tp)),
+            preflight_runtime_bytes, curve, reservation_at));
+    }
     target_plan_phase.complete();
 
     auto materialized = artifact::materialize(reader, load_plan.materialization(), execution,

@@ -739,6 +739,15 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
     }
 }
 
+std::size_t free_device_bytes(DeviceContext& target) {
+    const schedule::CurrentDevice scope;
+    target.bind_to_current_thread();
+    std::size_t free_bytes  = 0;
+    std::size_t total_bytes = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    return free_bytes;
+}
+
 } // namespace
 
 PeerRuntime::PeerRuntime(DeviceContext& peer_device, const LoadedModelData& peer_model,
@@ -1194,7 +1203,18 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     device.synchronize();
     if (use_cuda_graph) {
         StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
+        const std::size_t free_before      = free_device_bytes(device);
+        const std::size_t peer_free_before = peer ? free_device_bytes(peer->device) : 0;
         prepare_graphs();
+        device.synchronize();
+        const std::size_t free_after = free_device_bytes(device);
+        graph_observed_bytes = free_before > free_after ? free_before - free_after : 0;
+        if (peer) {
+            peer->device.synchronize();
+            const std::size_t peer_free_after = free_device_bytes(peer->device);
+            graph_peer_observed_bytes =
+                peer_free_before > peer_free_after ? peer_free_before - peer_free_after : 0;
+        }
         graph_phase.complete();
     }
     work.reset();
@@ -12741,6 +12761,8 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     }
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
+    out.cuda_graph_observed_bytes    = graph_observed_bytes;
+    out.cuda_graph_peer_observed_bytes = graph_peer_observed_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
     if (host_state_images) {
         out.host_state_capacity_slots = host_state_images->capacity();

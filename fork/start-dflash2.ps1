@@ -1,6 +1,6 @@
 param(
     [int]$Port = 30000,
-    [int]$MaxContext = 32768,
+    [int]$MaxContext = 89856,
     [int]$DraftTokens = 4,
     [int]$KvCapacity = 0,
     [int[]]$Devices = @(0, 1),
