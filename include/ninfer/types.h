@@ -197,6 +197,14 @@ struct EngineOptions {
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
+    // CUDA device id that holds the Vision tower and runs the encoder. -1 selects rank 0. At
+    // `tp == 2` it must name one of `devices`; the other rank receives only the encoded
+    // embeddings, so it pays neither the tower's weights nor its encode workspace.
+    int vision_device = -1;
+    // Largest merged-token extent one image/video item may encode (0 = the target's compiled
+    // ceiling, 16384). Images are resized so that pixels <= 32*32*N; the Vision encode workspace
+    // is planned for exactly this extent, so a small N frees device memory for KV.
+    std::uint32_t max_vision_tokens        = 0;
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;

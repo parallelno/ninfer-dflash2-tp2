@@ -128,7 +128,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--vision] [--vision-device N] [--max-vision-tokens N] [--no-cuda-graph] "
+           "[--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -147,6 +148,12 @@ std::string serve_usage_text(const char* argv0) {
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
+           "       --vision-device selects the CUDA device that holds the Vision tower and runs "
+           "the encoder (default: rank 0's device). At --tp 2 it must be one of --devices; the "
+           "other rank then holds no Vision weights or encode workspace.\n"
+           "       --max-vision-tokens caps the merged Vision tokens per image/video item (default "
+           "16384); images are resized to at most 32*32*N pixels and the Vision encode workspace "
+           "is planned for N, so a smaller N leaves more device memory for KV.\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
@@ -363,6 +370,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.default_thinking_budget = static_cast<std::uint32_t>(budget);
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--vision-device") {
+            options.vision_device =
+                parse_nonnegative_int(require_value("--vision-device"), "vision-device");
+        } else if (arg == "--max-vision-tokens") {
+            const std::uint64_t tokens =
+                parse_u64(require_value("--max-vision-tokens"), "max-vision-tokens");
+            if (tokens == 0 || tokens > 16384) {
+                throw std::invalid_argument("--max-vision-tokens must be in [1,16384]");
+            }
+            options.max_vision_tokens = static_cast<std::uint32_t>(tokens);
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {

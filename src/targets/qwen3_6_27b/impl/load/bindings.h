@@ -152,12 +152,15 @@ struct TextConfig;
 struct ShardMapping {
     artifact::ShardAxis axis = artifact::ShardAxis::Replicated;
     ShardPlan shards;
+    // Holder under `SingleDevice`; unused by every other axis.
+    int device = 0;
 };
 
 // Same contract as `plan_for` below, plus the axis. `tp == 1` returns a replicated mapping with no
-// shards before any family check runs, exactly as `plan_for` does.
+// shards before any family check runs, exactly as `plan_for` does. `vision_device` is the rank
+// that holds the whole Vision tower (`vision/*` maps to `SingleDevice` on it).
 [[nodiscard]] ShardMapping shard_mapping_for(std::string_view object, int tp,
-                                             const TextConfig& config);
+                                             const TextConfig& config, int vision_device = 0);
 
 // Computes the TP2 shard map for one artifact weight object. `object` is matched by suffix
 // against the local binder names used in bindings.cpp (e.g. "attention/query_key_gate_value",

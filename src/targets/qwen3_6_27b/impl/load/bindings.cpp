@@ -579,7 +579,8 @@ void append_vocab_rows(ShardPlan& plan, std::uint64_t rows, int tp, std::string_
 // The family dispatch behind both `plan_for` and `shard_mapping_for`, so the axis and the shard
 // boundaries can never disagree about a family. `tp >= 2` here; the tp<1 / tp==1 contract lives in
 // the two public entry points.
-ShardMapping shard_mapping(std::string_view object, int tp, const TextConfig& config) {
+ShardMapping shard_mapping(std::string_view object, int tp, const TextConfig& config,
+                           int vision_device) {
     ShardPlan plan;
     const auto ends = [&](std::string_view suffix) { return ends_with(object, suffix); };
     const auto by_rows = [](ShardPlan&& shards) {
@@ -600,12 +601,15 @@ ShardMapping shard_mapping(std::string_view object, int tp, const TextConfig& co
         return ShardMapping{artifact::ShardAxis::PrimaryOnly, {}};
     }
 
-    // Vision tower: replicated on EVERY device. The tp2 vision path runs the same single-device
-    // encoder independently on each rank against its own full weight copy (~282 MiB), so nothing
-    // about it is axis-split and no collective is needed. Prefix matching covers every vision
+    // Vision tower: whole copy on ONE device, the rank `EngineOptions::vision_device` selects.
+    // That rank runs the single-device encoder; the other rank receives only the encoded
+    // embeddings (a few KiB per merged token) over a device-to-device copy, so it pays neither
+    // the ~282 MiB of tower weights nor the encode workspace. Prefix matching covers every vision
     // object (patch/position embeddings, all layers, merger) and stays correct if the tower gains
     // tensors later. Checked before the text rules because its leaf names collide with them.
-    if (object.starts_with("vision/")) { return {}; }
+    if (object.starts_with("vision/")) {
+        return ShardMapping{artifact::ShardAxis::SingleDevice, {}, vision_device};
+    }
 
     // Replicated: full copy on every device (shards stays empty).
     //
@@ -863,10 +867,11 @@ ShardMapping shard_mapping(std::string_view object, int tp, const TextConfig& co
 // list is empty under a non-replicated axis cannot happen (every append_* helper emits one shard
 // per device), but an empty list is defined as "whole object" by ShardPlacement anyway.
 artifact::ShardPlacement shard_placement(std::string_view object, int tp,
-                                         const TextConfig& config) {
-    const ShardMapping mapping = shard_mapping_for(object, tp, config);
+                                         const TextConfig& config, int vision_device) {
+    const ShardMapping mapping = shard_mapping_for(object, tp, config, vision_device);
     artifact::ShardPlacement placement;
-    placement.axis = mapping.axis;
+    placement.axis   = mapping.axis;
+    placement.device = mapping.device;
     for (const Shard& shard : mapping.shards) {
         if (shard.device < 0 || shard.device >= static_cast<int>(artifact::kMaximumDevices)) {
             throw std::invalid_argument("shard map names a device outside this build's limit");
@@ -879,10 +884,14 @@ artifact::ShardPlacement shard_placement(std::string_view object, int tp,
 
 } // namespace
 
-ShardMapping shard_mapping_for(std::string_view object, int tp, const TextConfig& config) {
+ShardMapping shard_mapping_for(std::string_view object, int tp, const TextConfig& config,
+                               int vision_device) {
     if (tp < 1) { throw std::invalid_argument("plan_for: tp must be >= 1"); }
     if (tp == 1) { return {}; } // degenerate: full copy on device 0, same as replicated.
-    return shard_mapping(object, tp, config);
+    if (vision_device < 0 || vision_device >= tp) {
+        throw std::invalid_argument("shard_mapping_for: vision_device must be a rank below tp");
+    }
+    return shard_mapping(object, tp, config, vision_device);
 }
 
 ShardPlan plan_for(std::string_view object, int tp, const TextConfig& config) {
@@ -903,12 +912,16 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                                     " device(s) but bind_artifact was asked for tp " +
                                     std::to_string(tp));
     }
+    if (features.vision_rank < 0 || features.vision_rank >= tp) {
+        throw std::invalid_argument("qwen3_6_27b: vision_rank must name a tp rank");
+    }
     if (tp > 1) {
-        // Vision is fully replicated through shard_mapping (every `vision/` object returns a
-        // Replicated placement): a tp2 bind with --vision places the whole tower on both devices.
+        // `vision/` objects land whole on rank `features.vision_rank` only (SingleDevice); every
+        // other whole object is replicated and the text families are axis-split.
         const TextConfig config{};
-        binder.set_shard_resolver([config, tp](std::string_view name) {
-            return shard_placement(name, tp, config);
+        const int vision_rank = features.vision_rank;
+        binder.set_shard_resolver([config, tp, vision_rank](std::string_view name) {
+            return shard_placement(name, tp, config, vision_rank);
         });
     }
     ArtifactLoadPlan load_plan;
@@ -1200,8 +1213,9 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
                                           NumericFormat::BF16, {256, 248320}, device);
     }
 
-    if (plan.features.vision) {
-        // Dual-replicated vision: each rank materializes the full tower view from its own arena.
+    if (plan.features.vision && device == plan.features.vision_rank) {
+        // Only the vision rank's arena holds the tower (SingleDevice placement); the other rank's
+        // view leaves `vision` empty and receives encoded embeddings over a device copy.
         auto& vision  = runtime.vision.emplace();
         vision.common = qwen3_6::materialize_vision_common(
             backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm,

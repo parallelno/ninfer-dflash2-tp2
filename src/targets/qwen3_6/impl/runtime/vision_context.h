@@ -93,18 +93,22 @@ struct VisionChunk {
     std::int32_t length                       = 0;
     const qwen3_6::VisionItemControl* control = nullptr;
     Tensor embeddings;
-    // Rank 1's copy of the SAME item's output (dual-replicated tp2 vision): each rank encodes the
-    // item against its own full weight copy, so the tp2 text prefill scatters rank-local
-    // embeddings on both devices with zero cross-GPU traffic. Empty at tp 1.
+    // Rank 1's copy of the SAME item's output at tp2. The tower lives on exactly one rank
+    // (`VisionPeerBundle::vision_rank`); that rank encodes into its own handoff region and the
+    // result is copied device-to-device into the other rank's handoff, so the tp2 text prefill
+    // scatters rank-local embeddings on both devices. Empty at tp 1.
     Tensor embeddings_peer;
 };
 
-// Everything the session needs to mirror the encode on rank 1. Supplied only at tp == 2; the
-// peer workspace is laid out by the same VisionWorkspacePlan as rank 0's.
+// Everything the session needs to run vision at tp == 2. `device`/`model`/`workspace` describe
+// rank 1 (rank 0 is the session's primary arguments); the peer workspace is laid out by the same
+// VisionWorkspacePlan as rank 0's. `vision_rank` names the rank whose `LoadedModelData::vision`
+// holds the tower and therefore runs the encoder; the other rank only receives the output.
 struct VisionPeerBundle {
     DeviceContext* device        = nullptr;
     const LoadedModelData* model = nullptr;
     DeviceSpan workspace{};
+    int vision_rank = 0;
 };
 
 class VisionPrefillSession {
@@ -131,15 +135,21 @@ private:
     qwen3_6::PreparedPromptData& prompt_;
     const VisionPrefillPlan& plan_;
     std::size_t& handoff_peak_bytes_;
-    VisionContext context_;
     std::optional<VisionPeerBundle> peer_;
-    std::optional<VisionContext> context_peer_;
+    // Exactly one of these is engaged: the rank that holds the tower weights.
+    std::optional<VisionContext> context_;      // rank 0 encodes
+    std::optional<VisionContext> context_peer_; // rank 1 encodes
+    // tp2 only: `encode_done_` is recorded on the encoding rank's stream after the encode and
+    // waited on by the receiving rank before its pull copy; `copy_done_` is recorded on the
+    // receiving rank's stream after the copy and waited on by the encoding rank so its handoff
+    // region is not reused before the bytes have left.
+    std::optional<CudaCompletionEvent> encode_done_;
+    std::optional<CudaCompletionEvent> copy_done_;
     std::size_t next_use_ = 0;
     std::optional<std::uint32_t> active_item_;
     std::size_t active_handoff_bytes_ = 0;
     std::vector<std::uint32_t> encoded_payloads_pending_release_;
     std::vector<CudaEventTimer> timers_;
-    std::vector<CudaEventTimer> peer_timers_;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

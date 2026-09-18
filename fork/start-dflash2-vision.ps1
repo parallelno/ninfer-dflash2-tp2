@@ -1,12 +1,20 @@
 param(
-    [string]$modelId = 'qwen-dflash2',
+    [string]$modelId = 'qwen-dflash2-vision',
     [int]$Port = 30000,
-    # preflight reports ~110.7K as the ceiling on rank 0 (16 GB) with the 24 MiB/class tp2 graph allowance
-    [int]$MaxContext = 7000,
+    # measured: 105,000 fits with -VisionDevice 1 -MaxVisionTokens 1024 (200 MiB free on rank 0);
+    # the old dual-replicated 16384-token layout capped out at ~51K
+    [int]$MaxContext = 105000,
     [int]$DraftTokens = 4,
     [int]$Timeout = 600000,
     [int]$KvCapacity = 0,
     [int[]]$Devices = @(0, 1),
+    # CUDA device id that holds the vision tower (~282 MiB weights + encode workspace). Rank 0
+    # (device 0) already carries the ~2 GiB rank-only DFlash2 draft, so rank 1 has the headroom.
+    [int]$VisionDevice = 1,
+    # Per-image cap in merged vision tokens; one token covers 32x32 px, so
+    #   256 -> ~512x512, 1024 -> ~1024x1024, 2048 -> ~1448x1448, 16384 -> ~4096x4096 (ceiling).
+    # Larger images are downscaled to fit; the encode workspace scales with this value.
+    [int]$MaxVisionTokens = 1024,
     [switch]$NoCudaGraph
 )
 
@@ -18,6 +26,10 @@ $model = Join-Path $repo 'model\qwen3_8_27b_nvfp4.dflash2.ninfer'
 
 if ($Devices.Count -ne 2) {
     throw '-Devices must contain exactly two CUDA device ids.'
+}
+
+if ($Devices -notcontains $VisionDevice) {
+    throw '-VisionDevice must be one of -Devices.'
 }
 
 if (-not (Test-Path -LiteralPath $server -PathType Leaf)) {
@@ -44,7 +56,9 @@ $arguments = @(
     '--draft-tokens', $DraftTokens,
     '--lm-head-draft',
     '--pending-timeout-ms', $Timeout,
-    '--vision'
+    '--vision',
+    '--vision-device', $VisionDevice,
+    '--max-vision-tokens', $MaxVisionTokens
 )
 
 if ($NoCudaGraph) {

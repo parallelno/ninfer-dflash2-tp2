@@ -75,6 +75,21 @@ void validate_options(const EngineOptions& options) {
         throw std::invalid_argument(
             "Engine media_live_bytes must be nonzero when Vision is enabled");
     }
+    if (options.enable_vision && options.vision_device >= 0) {
+        const bool listed = options.devices.empty()
+                                ? options.vision_device == options.device
+                                : std::find(options.devices.begin(), options.devices.end(),
+                                            options.vision_device) != options.devices.end();
+        if (!listed) {
+            throw std::invalid_argument(
+                "Engine vision_device must be one of the execution devices");
+        }
+    }
+    if (options.enable_vision && options.max_vision_tokens != 0 &&
+        (options.max_vision_tokens < 64 || options.max_vision_tokens > 16384)) {
+        // 64 merged tokens is the registered 65,536-pixel image minimum.
+        throw std::invalid_argument("Engine max_vision_tokens must be in [64,16384]");
+    }
     if (options.media_preprocess_threads > 64) {
         throw std::invalid_argument("Engine media_preprocess_threads must be in [0,64]");
     }

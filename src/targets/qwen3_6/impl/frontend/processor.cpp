@@ -272,7 +272,8 @@ void append_patch(const std::vector<const media::decode::Image*>& frames, int gr
 }
 
 void add_budget(PreprocessStats& stats, const VisionItem& item);
-void enforce_media_item_resource_limits(const PreprocessStats& stats);
+void enforce_media_item_resource_limits(const PreprocessStats& stats,
+                                        const ProcessorOptions& options);
 void enforce_media_resource_limits(const PreprocessStats& stats, const ProcessorOptions& options);
 
 // Miss builders run concurrently. Claim their aggregate extent before allocating the retained
@@ -307,7 +308,7 @@ Prepared prepare_image(std::span<const std::uint8_t> bytes, const ProcessorOptio
     out.item.grid     = {1, gh, gw};
     PreprocessStats item_stats;
     add_budget(item_stats, out.item);
-    enforce_media_item_resource_limits(item_stats);
+    enforce_media_item_resource_limits(item_stats, options);
     request_budget.claim(out.item);
     const std::size_t elements = static_cast<std::size_t>(gh) * gw * kPatchFeatures;
     out.payload                = cache.allocate_payload(elements, control);
@@ -362,7 +363,7 @@ Prepared prepare_video(std::span<const std::uint8_t> bytes, const ProcessorOptio
     out.item.grid     = {gt, gh, gw};
     PreprocessStats item_stats;
     add_budget(item_stats, out.item);
-    enforce_media_item_resource_limits(item_stats);
+    enforce_media_item_resource_limits(item_stats, options);
     request_budget.claim(out.item);
     const std::size_t elements = static_cast<std::size_t>(gt) * gh * gw * kPatchFeatures;
     out.payload                = cache.allocate_payload(elements, control);
@@ -617,12 +618,15 @@ void add_budget(PreprocessStats& stats, const VisionItem& item) {
                                          "vision attention pairs");
 }
 
-void enforce_media_item_resource_limits(const PreprocessStats& stats) {
-    if (stats.raw_patches > kMaximumVisionItemRawPatches) {
+void enforce_media_item_resource_limits(const PreprocessStats& stats,
+                                        const ProcessorOptions& options) {
+    const std::uint64_t item_tokens =
+        std::min<std::uint64_t>(options.max_item_vision_tokens, kMaximumVisionItemTokens);
+    if (stats.raw_patches > item_tokens * kRawPatchesPerVisionToken) {
         throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
                              "single media item raw patches exceed Vision execution capacity");
     }
-    if (stats.vision_tokens > kMaximumVisionItemTokens) {
+    if (stats.vision_tokens > item_tokens) {
         throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
                              "single media item tokens exceed Vision execution capacity");
     }
@@ -899,7 +903,7 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
                                   : inspect_video_item(part->media.bytes, options_, policy);
             PreprocessStats item_stats;
             add_budget(item_stats, item);
-            enforce_media_item_resource_limits(item_stats);
+            enforce_media_item_resource_limits(item_stats, options_);
             add_budget(stats, item);
             enforce_media_resource_limits(stats, options_);
             items.push_back(std::move(item));
@@ -1033,7 +1037,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         try {
             PreprocessStats item_stats;
             add_budget(item_stats, item);
-            enforce_media_item_resource_limits(item_stats);
+            enforce_media_item_resource_limits(item_stats, options_);
             add_budget(stats, item);
             enforce_media_resource_limits(stats, options_);
         } catch (...) {

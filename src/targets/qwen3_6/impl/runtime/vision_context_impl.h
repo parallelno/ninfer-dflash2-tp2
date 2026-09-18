@@ -396,8 +396,7 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
                                            std::size_t& handoff_peak_bytes,
                                            std::optional<VisionPeerBundle> peer)
     : device_(device), workspace_(workspace), workspace_plan_(workspace_plan), prompt_(prompt),
-      plan_(plan), handoff_peak_bytes_(handoff_peak_bytes), context_(device, model),
-      peer_(std::move(peer)) {
+      plan_(plan), handoff_peak_bytes_(handoff_peak_bytes), peer_(std::move(peer)) {
     if (plan_.control == nullptr || plan_.control->items.empty() || plan_.uses.empty()) {
         throw std::invalid_argument("Vision prefill plan has no suffix item spans");
     }
@@ -413,7 +412,26 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
             peer_->workspace.bytes < workspace_plan_.capacity_bytes) {
             throw std::invalid_argument("Vision peer workspace is missing or too small");
         }
-        context_peer_.emplace(*peer_->device, *peer_->model);
+        if (peer_->vision_rank != 0 && peer_->vision_rank != 1) {
+            throw std::invalid_argument("Vision peer bundle names an invalid vision rank");
+        }
+        // Construct the encoder on the rank that owns the tower (VisionContext throws when the
+        // model view has no vision weights, so a mismatched loader placement fails here).
+        // CudaCompletionEvent's ctor binds its device to the thread, so restore the caller's.
+        int previous_device = 0;
+        CUDA_CHECK(cudaGetDevice(&previous_device));
+        if (peer_->vision_rank == 0) {
+            context_.emplace(device_, model);
+            encode_done_.emplace(device_);
+            copy_done_.emplace(*peer_->device);
+        } else {
+            context_peer_.emplace(*peer_->device, *peer_->model);
+            encode_done_.emplace(*peer_->device);
+            copy_done_.emplace(device_);
+        }
+        CUDA_CHECK(cudaSetDevice(previous_device));
+    } else {
+        context_.emplace(device_, model);
     }
     std::uint32_t previous_end = 0;
     std::optional<std::uint32_t> previous_item;
@@ -466,7 +484,6 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
     }
     encoded_payloads_pending_release_.reserve(plan_.uses.size());
     timers_.reserve(plan_.uses.size());
-    if (context_peer_) { peer_timers_.reserve(plan_.uses.size()); }
 }
 
 VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length) {
@@ -493,30 +510,52 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
     const qwen3_6::VisionItemControl& control = plan_.control->items[active->control_index];
     Tensor output = VisionContext::bind_output(workspace_, workspace_plan_, control.merged_count);
     Tensor output_peer;
-    if (context_peer_) {
+    if (peer_) {
         output_peer =
             VisionContext::bind_output(peer_->workspace, workspace_plan_, control.merged_count);
     }
 
     if (!active_item_ || *active_item_ != active->prepared_item_index) {
         const auto& payload = prompt_.media_payloads[active->prepared_item_index];
-        timers_.emplace_back(device_);
-        timers_.back().start();
-        context_.encode(VisionItemView{payload->span(), &control}, output, workspace_,
-                        workspace_plan_);
-        timers_.back().record_stop();
-        if (context_peer_) {
-            // Rank 1 runs the IDENTICAL single-device schedule over the same host payload against
-            // its own full weight copy: no collective, no cross-GPU copy, bit-identical output.
-            // Kernel launches and timer events are device-scoped, so the peer must be current.
+        if (!peer_) {
+            timers_.emplace_back(device_);
+            timers_.back().start();
+            context_->encode(VisionItemView{payload->span(), &control}, output, workspace_,
+                             workspace_plan_);
+            timers_.back().record_stop();
+        } else {
+            // tp2: encode once on the rank that holds the tower, then pull the merged embeddings
+            // (merged_count x out_hidden BF16, a few KiB per token) into the other rank's handoff
+            // on THAT rank's stream. Kernel launches and events are device-scoped, so the current
+            // device follows the stream being enqueued on. `cudaMemcpyAsync` with UVA pointers is
+            // the same cross-device transfer as the peer form (see ops/common/allreduce.cu).
+            const bool encode_on_rank0     = context_.has_value();
+            DeviceContext& encode_device   = encode_on_rank0 ? device_ : *peer_->device;
+            DeviceContext& receive_device  = encode_on_rank0 ? *peer_->device : device_;
+            const VisionContext& encoder   = encode_on_rank0 ? *context_ : *context_peer_;
+            const DeviceSpan encode_space  = encode_on_rank0 ? workspace_ : peer_->workspace;
+            Tensor& encode_output          = encode_on_rank0 ? output : output_peer;
+            const Tensor& receive_output   = encode_on_rank0 ? output_peer : output;
             int previous_device = 0;
             CUDA_CHECK(cudaGetDevice(&previous_device));
-            CUDA_CHECK(cudaSetDevice(peer_->device->device));
-            peer_timers_.emplace_back(*peer_->device);
-            peer_timers_.back().start();
-            context_peer_->encode(VisionItemView{payload->span(), &control}, output_peer,
-                                  peer_->workspace, workspace_plan_);
-            peer_timers_.back().record_stop();
+
+            CUDA_CHECK(cudaSetDevice(encode_device.device));
+            timers_.emplace_back(encode_device);
+            timers_.back().start();
+            encoder.encode(VisionItemView{payload->span(), &control}, encode_output, encode_space,
+                           workspace_plan_);
+            timers_.back().record_stop();
+            encode_done_->record(encode_device.stream);
+
+            CUDA_CHECK(cudaSetDevice(receive_device.device));
+            encode_done_->wait(receive_device.stream);
+            CUDA_CHECK(cudaMemcpyAsync(receive_output.data, encode_output.data,
+                                       encode_output.bytes(), cudaMemcpyDeviceToDevice,
+                                       receive_device.stream));
+            copy_done_->record(receive_device.stream);
+
+            CUDA_CHECK(cudaSetDevice(encode_device.device));
+            copy_done_->wait(encode_device.stream);
             CUDA_CHECK(cudaSetDevice(previous_device));
         }
         active_item_          = active->prepared_item_index;
@@ -541,12 +580,9 @@ void VisionPrefillSession::retire_handoff() noexcept {
 }
 
 double VisionPrefillSession::elapsed_seconds() const {
-    double milliseconds      = 0.0;
-    double peer_milliseconds = 0.0;
+    double milliseconds = 0.0;
     for (const CudaEventTimer& timer : timers_) { milliseconds += timer.elapsed_ms(); }
-    for (const CudaEventTimer& timer : peer_timers_) { peer_milliseconds += timer.elapsed_ms(); }
-    // The two encodes run concurrently on independent devices: wall-clock is the slower one.
-    return std::max(milliseconds, peer_milliseconds) / 1000.0;
+    return milliseconds / 1000.0;
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

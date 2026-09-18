@@ -185,11 +185,17 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         out.stats_.device_capacity_bytes =
             checked_add(out.stats_.device_capacity_bytes, capacity, "device capacity overflows u64");
     }
-    // One placement per (object, device); every device tensor has a device-0 placement, so
-    // counting those keeps `tensor_count` the number of distinct tensors at any tp.
-    out.stats_.tensor_count = static_cast<std::size_t>(
-        std::count_if(plan.device_objects.begin(), plan.device_objects.end(),
-                      [](const DeviceMaterialization& placement) { return placement.device == 0; }));
+    // One placement per (object, device); count distinct objects so a tensor held only by a
+    // non-primary device (SingleDevice) still counts once.
+    {
+        std::vector<bool> seen(plan.object_count, false);
+        for (const DeviceMaterialization& placement : plan.device_objects) {
+            if (!seen.at(placement.object.index)) {
+                seen[placement.object.index] = true;
+                ++out.stats_.tensor_count;
+            }
+        }
+    }
     out.stats_.resource_count = plan.host_objects.size();
     {
         // Placement kind per object: a sharded object carries plane copies; a whole object placed

@@ -817,9 +817,14 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     if (model.features != plan.features || model.mtp.has_value() != plan.features.mtp() ||
         model.dflash.has_value() != plan.features.masked_draft() ||
         model.optimized_proposal.has_value() != plan.features.optimized_proposal() ||
-        model.vision.has_value() != plan.features.vision) {
+        model.vision.has_value() != (plan.features.vision && plan.features.vision_rank == 0)) {
         throw std::invalid_argument(
             "Qwen3.6 loaded weights do not match the frozen startup features");
+    }
+    if (peer_model != nullptr &&
+        peer_model->vision.has_value() != (plan.features.vision && plan.features.vision_rank == 1)) {
+        throw std::invalid_argument(
+            "Qwen3.6 peer weights do not match the frozen vision placement");
     }
     if (model.mtp.has_value() && model.dflash.has_value()) {
         throw std::invalid_argument("MTP and DFlash model views are mutually exclusive");
@@ -4705,16 +4710,18 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
             }
             std::optional<schedule::VisionPeerBundle> vision_peer;
             if (tp != 1) {
-                // Dual-replicated vision: rank 1 mirrors the encode against its own weights into
-                // its own workspace, laid out by the same plan (PeerRuntime is sized from it).
+                // Single-rank vision: the tower lives on rank `vision_rank` only; that rank
+                // encodes and the session copies the embeddings into the other rank's workspace,
+                // laid out by the same plan (PeerRuntime is sized from it).
                 if (!peer) {
                     throw std::logic_error("tensor-parallel Vision prefill requires a peer runtime");
                 }
                 vision_peer = schedule::VisionPeerBundle{
-                    .device    = &peer->device,
-                    .model     = &peer->model,
-                    .workspace = DeviceSpan{peer->workspace_storage.base(),
-                                            peer->workspace_storage.capacity()},
+                    .device      = &peer->device,
+                    .model       = &peer->model,
+                    .workspace   = DeviceSpan{peer->workspace_storage.base(),
+                                              peer->workspace_storage.capacity()},
+                    .vision_rank = model.features.vision_rank,
                 };
             }
             request.prefill->vision = std::make_unique<schedule::VisionPrefillSession>(

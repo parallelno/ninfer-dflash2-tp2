@@ -892,6 +892,26 @@ public:
             std::min<std::uint64_t>(options.max_context, kMaximumPromptVisionTokens);
         processor.max_vision_tokens = vision_tokens;
         processor.max_raw_patches   = vision_tokens * kRawPatchesPerVisionToken;
+        if (registered_checkpoint) {
+            validate_registered_processor(processor);
+            validate_registered_tokenizer(*tokenizer);
+        }
+        if (options.max_vision_item_tokens == 0 ||
+            options.max_vision_item_tokens > kMaximumVisionItemTokens) {
+            throw std::invalid_argument("frontend max_vision_item_tokens is out of range");
+        }
+        {
+            // One merged token covers a 2x2 block of 16px patches: 1024 pixels per token.
+            const std::uint64_t item_pixels =
+                static_cast<std::uint64_t>(options.max_vision_item_tokens) * 32ULL * 32ULL;
+            if (item_pixels < processor.image_min_pixels) {
+                throw std::invalid_argument(
+                    "max_vision_item_tokens is below the registered image minimum");
+            }
+            processor.max_item_vision_tokens = options.max_vision_item_tokens;
+            processor.image_max_pixels = std::min(processor.image_max_pixels, item_pixels);
+            processor.video_max_pixels = std::min(processor.video_max_pixels, item_pixels);
+        }
         if (vision_enabled) {
             const std::uint64_t minimum_live =
                 processor.max_raw_patches * kPreparedVisionPatchFeatures * sizeof(std::uint16_t);
@@ -902,10 +922,6 @@ public:
             media_cache = std::make_shared<fi::MediaPreprocessCache>(
                 options.media_cache_bytes, options.media_live_bytes,
                 options.media_preprocess_threads, static_cast<std::size_t>(minimum_live));
-        }
-        if (registered_checkpoint) {
-            validate_registered_processor(processor);
-            validate_registered_tokenizer(*tokenizer);
         }
         for (const int token : tokenizer->default_stop_token_ids()) {
             if (!tokenizer->is_valid_token(token)) {

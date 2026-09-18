@@ -53,6 +53,8 @@ struct ServeOptions {
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;
     bool enable_vision      = false;
+    int vision_device       = -1; // -1: rank 0's device
+    std::uint32_t max_vision_tokens = 0; // 0: compiled ceiling (16384 merged tokens per item)
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
     bool enable_thinking =

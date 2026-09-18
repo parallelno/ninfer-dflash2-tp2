@@ -693,8 +693,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                   out.dflash_context, out.dflash_round, out.causal_score});
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
-        const std::uint32_t merged = static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(plan.capacity, kMaximumVisionItemTokens));
+        const std::uint32_t merged = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            {plan.capacity, kMaximumVisionItemTokens, plan.features.max_vision_item_tokens}));
         out.vision   = schedule::VisionContext::plan_workspace(merged, out.general_capacity);
         out.capacity = std::max(out.capacity, out.vision->capacity_bytes);
     }

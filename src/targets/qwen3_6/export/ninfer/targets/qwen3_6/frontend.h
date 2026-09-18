@@ -18,6 +18,8 @@ inline constexpr std::size_t kTokenDomain = 248077;
 struct FrontendOptions {
     bool vision_enabled                    = true;
     std::uint32_t max_context              = 2'048;
+    // Per-item merged-token ceiling; images/videos are resized to fit 32*32*N pixels.
+    std::uint32_t max_vision_item_tokens   = 16'384;
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
