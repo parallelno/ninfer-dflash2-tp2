@@ -2,7 +2,7 @@ param(
     [string]$modelId = 'qwen-dflash2',
     [int]$Port = 30000,
     # preflight reports ~110.7K as the ceiling on rank 0 (16 GB) with the 24 MiB/class tp2 graph allowance
-    [int]$MaxContext = 110000,
+    [int]$MaxContext = 7000,
     [int]$DraftTokens = 4,
     [int]$Timeout = 600000,
     [int]$KvCapacity = 0,
@@ -43,7 +43,8 @@ $arguments = @(
     '--spec', 'dflash2',
     '--draft-tokens', $DraftTokens,
     '--lm-head-draft',
-    '--pending-timeout-ms', $Timeout
+    '--pending-timeout-ms', $Timeout,
+    '--vision'
 )
 
 if ($NoCudaGraph) {
