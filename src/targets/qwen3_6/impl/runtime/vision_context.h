@@ -93,6 +93,18 @@ struct VisionChunk {
     std::int32_t length                       = 0;
     const qwen3_6::VisionItemControl* control = nullptr;
     Tensor embeddings;
+    // Rank 1's copy of the SAME item's output (dual-replicated tp2 vision): each rank encodes the
+    // item against its own full weight copy, so the tp2 text prefill scatters rank-local
+    // embeddings on both devices with zero cross-GPU traffic. Empty at tp 1.
+    Tensor embeddings_peer;
+};
+
+// Everything the session needs to mirror the encode on rank 1. Supplied only at tp == 2; the
+// peer workspace is laid out by the same VisionWorkspacePlan as rank 0's.
+struct VisionPeerBundle {
+    DeviceContext* device        = nullptr;
+    const LoadedModelData* model = nullptr;
+    DeviceSpan workspace{};
 };
 
 class VisionPrefillSession {
@@ -100,7 +112,8 @@ public:
     VisionPrefillSession(DeviceContext& device, const LoadedModelData& model, DeviceSpan workspace,
                          const VisionWorkspacePlan& workspace_plan,
                          qwen3_6::PreparedPromptData& prompt, const VisionPrefillPlan& plan,
-                         std::size_t& handoff_peak_bytes);
+                         std::size_t& handoff_peak_bytes,
+                         std::optional<VisionPeerBundle> peer = std::nullopt);
 
     [[nodiscard]] VisionChunk prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length);
     void release_encoded_media_payloads() noexcept;
@@ -119,11 +132,14 @@ private:
     const VisionPrefillPlan& plan_;
     std::size_t& handoff_peak_bytes_;
     VisionContext context_;
+    std::optional<VisionPeerBundle> peer_;
+    std::optional<VisionContext> context_peer_;
     std::size_t next_use_ = 0;
     std::optional<std::uint32_t> active_item_;
     std::size_t active_handoff_bytes_ = 0;
     std::vector<std::uint32_t> encoded_payloads_pending_release_;
     std::vector<CudaEventTimer> timers_;
+    std::vector<CudaEventTimer> peer_timers_;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

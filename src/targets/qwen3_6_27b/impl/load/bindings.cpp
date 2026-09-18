@@ -600,6 +600,13 @@ ShardMapping shard_mapping(std::string_view object, int tp, const TextConfig& co
         return ShardMapping{artifact::ShardAxis::PrimaryOnly, {}};
     }
 
+    // Vision tower: replicated on EVERY device. The tp2 vision path runs the same single-device
+    // encoder independently on each rank against its own full weight copy (~282 MiB), so nothing
+    // about it is axis-split and no collective is needed. Prefix matching covers every vision
+    // object (patch/position embeddings, all layers, merger) and stays correct if the tower gains
+    // tensors later. Checked before the text rules because its leaf names collide with them.
+    if (object.starts_with("vision/")) { return {}; }
+
     // Replicated: full copy on every device (shards stays empty).
     //
     // `gdn/norm` stays here and that is VERIFIED, not inherited: its real bound shape is {128}
@@ -897,11 +904,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                                     std::to_string(tp));
     }
     if (tp > 1) {
-        if (features.vision) {
-            // The vision tower is out of scope for TP2 and has no shard map, so reject here
-            // rather than silently replicating a 4.6 GB backbone onto both devices.
-            throw std::invalid_argument("qwen3_6_27b: vision is not supported with tp > 1");
-        }
+        // Vision is fully replicated through shard_mapping (every `vision/` object returns a
+        // Replicated placement): a tp2 bind with --vision places the whole tower on both devices.
         const TextConfig config{};
         binder.set_shard_resolver([config, tp](std::string_view name) {
             return shard_placement(name, tp, config);
@@ -1197,17 +1201,16 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
     }
 
     if (plan.features.vision) {
-        if (tp != 1) {
-            throw std::invalid_argument(
-                "qwen3_6_27b: Vision has no tensor-parallel forward path yet");
-        }
+        // Dual-replicated vision: each rank materializes the full tower view from its own arena.
         auto& vision  = runtime.vision.emplace();
         vision.common = qwen3_6::materialize_vision_common(
-            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);
+            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm,
+            device);
         vision.merger_fc2      = artifact::materialized_weight(backing, plan.vision_merger_fc2,
-                                                               NumericFormat::W8G32_F16S, 5120, 4608);
+                                                               NumericFormat::W8G32_F16S, 5120, 4608,
+                                                               device);
         vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
-                                                               NumericFormat::BF16, {5120});
+                                                               NumericFormat::BF16, {5120}, device);
     }
 }
 

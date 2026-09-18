@@ -4703,10 +4703,24 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
             if (!workspace_plan.vision) {
                 throw std::logic_error("Vision prefill has no startup workspace plan");
             }
+            std::optional<schedule::VisionPeerBundle> vision_peer;
+            if (tp != 1) {
+                // Dual-replicated vision: rank 1 mirrors the encode against its own weights into
+                // its own workspace, laid out by the same plan (PeerRuntime is sized from it).
+                if (!peer) {
+                    throw std::logic_error("tensor-parallel Vision prefill requires a peer runtime");
+                }
+                vision_peer = schedule::VisionPeerBundle{
+                    .device    = &peer->device,
+                    .model     = &peer->model,
+                    .workspace = DeviceSpan{peer->workspace_storage.base(),
+                                            peer->workspace_storage.capacity()},
+                };
+            }
             request.prefill->vision = std::make_unique<schedule::VisionPrefillSession>(
                 device, model, DeviceSpan{workspace_storage.base(), workspace_storage.capacity()},
                 *workspace_plan.vision, request.prefill->prompt, *request.prefill->vision_plan,
-                vision_handoff_peak_bytes);
+                vision_handoff_peak_bytes, std::move(vision_peer));
         }
         request.prefill->elapsed_seconds =
             std::chrono::duration<double>(Clock::now() - host_started).count();
