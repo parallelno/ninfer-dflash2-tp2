@@ -75,6 +75,43 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
 }
 
+// Wavefront entry (prototype, H18 in fork/research-prefill-improvements2.md): hands ALL of the
+// remaining prompt to TextContext::prefill_wavefront_tp2, which pipelines consecutive chunks at
+// layer granularity. Returns processed_tokens == 0 when the wavefront does not apply (tp1, MTP
+// prompt prep, split frontier, single chunk, arena pressure); the caller then runs the ordinary
+// per-chunk path. With DFlash active each slot gets its own feature sink (slot 1's capture
+// buffers are cloned inside the wavefront call).
+PrefillChunkResult prefill_text_wavefront(PrefillContext& state, std::span<const TokenId> ids,
+                                          std::uint32_t nominal_length, bool finalize_at_end,
+                                          std::span<const std::uint32_t> split_frontiers) {
+    std::optional<TpExecution> tp = tp_execution(state.execution);
+    if (!tp) { return PrefillChunkResult{}; }
+    tp->mtp_kv = state.mtp_kv_peer;
+    TextContext card(state.execution.device, state.execution.model, state.execution.work,
+                     state.execution.rope_frequency, state.text_kv,
+                     state.execution.linear_attention, state.execution.io,
+                     state.execution.prefill_hidden, state.execution.prefill_chunk,
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
+                     &*tp);
+    configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
+                        state.state_destination_slot, state.mtp_proposal_extent);
+    const std::span<const int> prompt(ids.data(), ids.size());
+    DFlashFeatureSink sink0;
+    DFlashFeatureSink sink1;
+    DFlashFeatureSink* sinks[2] = {nullptr, nullptr};
+    if (state.dflash != nullptr) {
+        sink0    = make_dflash_prefill_sink(state);
+        sink1    = make_dflash_prefill_sink(state);
+        sinks[0] = &sink0;
+        sinks[1] = &sink1;
+    }
+    const std::uint32_t processed = card.prefill_chunk_wavefront(
+        prompt, state.text_kv_base, nominal_length, finalize_at_end, sinks, split_frontiers);
+    return PrefillChunkResult{.processed_tokens = processed,
+                              .finalized = finalize_at_end && processed == nominal_length,
+                              .timing    = {}};
+}
+
 PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
                                             VisionPrefillSession& vision,
                                             std::uint32_t nominal_length,

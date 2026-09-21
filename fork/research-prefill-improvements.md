@@ -1,3 +1,27 @@
+## 6. Follow-up (2026-09-20): lever 1 IMPLEMENTED and measured in production
+
+The pinned relay was implemented in `src/ops/common/allreduce.cu` (`pinned_relay_active` /
+`pinned_relay_bounce`): grow-only pinned bounce cache, engages only for eager, ≥1 MiB, no-P2P
+payloads (i.e. prefill chunks); captured call sites keep the mailbox, small eager payloads keep
+the staged path, `NINFER_TP2_RELAY=0` restores the old path at runtime.
+
+- **Microbench** (production-linked `temp\prefill_transport_bench.exe`, rebuilt against the new
+  libs): `(a) staged allreduce_sum chain x128` went 3,636 → 3,293 µs/call at 10 MiB (≈ the (d)
+  relay's 3,245 µs — the production path *is* the relay now), and 861 → 573 µs at 1.25 MiB.
+- **Server A/B, same binary** (relay on vs `NINFER_TP2_RELAY=0`, 1024-token chunks, dflash2):
+  1,088 tok: 1,310 → 1,272 ms; 4,144: 3,298 → 3,152; 8,398: 6,163 → 5,905; 17,071:
+  12,360 → 11,805 ms. Marginal rate **0.691 → 0.659 ms/token (1,446 → 1,518 tok/s, +5.0%)**;
+  the fixed ~0.41 s/request overhead is unchanged (it's not collective-bound).
+- **Bit-exact**: identical SHA256 over a 128-token completion on an 8,392-token prompt with the
+  relay on and off; `bench-dflash2.ps1` SHAs identical across rounds.
+
+The measured +5% matches the prediction (collectives are ~65% of prefill; the relay saves ~10%
+of that at 10 MiB payloads). Levers 2 (pipelined full-duplex relay, up to ~+25%) and 3
+(sequence parallelism, ~1.5×) remain open; lever 2's predicted headroom is confirmed by the (b)
+single-direction staged copy numbers (1.75 ms vs the 3.29 ms pair).
+
+---
+
 All tests are complete, servers stopped, GPUs clean. Here is the full report.
 
 ---

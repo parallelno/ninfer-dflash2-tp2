@@ -31,6 +31,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -67,6 +70,121 @@ cudaError_t pull_peer(void* destination, const void* source, std::size_t bytes,
                       cudaStream_t stream) {
     return cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDeviceToDevice, stream);
 }
+
+// PINNED CE RELAY (prefill transport). On a no-P2P pair the driver's internal staging of the
+// cudaMemcpyAsync(D2D/UVA) pull above measures ~3.65 ms per 10 MiB reduction on this fork's
+// reference machine (2x RTX 5060 Ti, Windows 11 WDDM), while the same exchange hand-staged
+// through pinned host buffers -- D2H into a pinned bounce buffer on the owner's stream, then an
+// H2D pull into the peer's staging -- measures ~3.28 ms with the identical four-event
+// choreography and the identical local combine, and ~35% faster at 1.25 MiB payloads. Prefill
+// runs its collectives eagerly (never captured), so this path engages only for eager, large,
+// no-P2P payloads; captured call sites and small payloads keep the staged/mailbox paths.
+//
+// The relay reuses the PeerEvents contract with shifted meanings: inputs_ready[r] publishes
+// "bounce[r] holds rank r's complete operand" (recorded after the D2H), pull_done[r] publishes
+// "rank r's H2D out of the peer's bounce buffer is complete". The phase-C wait on
+// pull_done[1-r] then orders both the in-place combine AND the next call's D2H overwrite of
+// bounce[r] after the peer's read -- the same write-after-read argument as the staged path.
+constexpr std::size_t kRelayMinBytes = 1u << 20;  // 1 MiB; smaller payloads stay staged/mailbox
+
+struct PinnedRelayCache {
+    const void* key     = nullptr;  // the PeerEvents instance whose protocol guards these buffers
+    void* bounce[2]     = {nullptr, nullptr};
+    std::size_t bytes   = 0;
+    std::uint64_t touch = 0;
+};
+
+// The wavefront prefill driver runs two chunks' collectives concurrently, each with its own
+// PeerEvents; one shared bounce pair would corrupt (slot B's D2H can overwrite a buffer slot A's
+// H2D has not finished). Bounce buffers are therefore keyed by the PeerEvents instance: each
+// concurrent collective stream gets its own pair, and the 4-event protocol of THAT instance
+// provides the cross-call write-after-read ordering for its buffers.
+constexpr std::size_t kRelayCacheEntries = 8;
+std::mutex g_pinned_relay_mutex;
+PinnedRelayCache g_pinned_relay[kRelayCacheEntries];
+std::uint64_t g_pinned_relay_tick = 0;
+
+// Grow-only cache of the two pinned bounce buffers for one PeerEvents key. Growth first
+// device-synchronizes both devices so no in-flight copy still references the buffers being
+// released. Throws on allocation failure; the caller treats that as fatal, like every other
+// CUDA_CHECK here.
+void* pinned_relay_bounce(const ExecutionContext& ec, const PeerEvents& events, int rank,
+                          std::size_t bytes) {
+    std::lock_guard<std::mutex> lock(g_pinned_relay_mutex);
+    const void* key = &events;
+    PinnedRelayCache* entry = nullptr;
+    PinnedRelayCache* oldest = &g_pinned_relay[0];
+    for (PinnedRelayCache& candidate : g_pinned_relay) {
+        if (candidate.key == key) { entry = &candidate; }
+        if (candidate.touch < oldest->touch) { oldest = &candidate; }
+    }
+    if (entry == nullptr) {
+        // Evict the least recently used entry. The device sync below (in the growth path or done
+        // here) retires any in-flight copies before its buffers change hands.
+        entry = oldest;
+        for (int r = 0; r < 2; ++r) {
+            CUDA_CHECK(cudaSetDevice(ec.dev[r]->device));
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        for (int r = 0; r < 2; ++r) {
+            if (entry->bounce[r] != nullptr) { CUDA_CHECK(cudaFreeHost(entry->bounce[r])); }
+            entry->bounce[r] = nullptr;
+        }
+        entry->bytes = 0;
+        entry->key   = key;
+    }
+    entry->touch = ++g_pinned_relay_tick;
+    if (entry->bytes >= bytes) { return entry->bounce[rank]; }
+    for (int r = 0; r < 2; ++r) {
+        CUDA_CHECK(cudaSetDevice(ec.dev[r]->device));
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    void* fresh[2] = {nullptr, nullptr};
+    for (int r = 0; r < 2; ++r) {
+        const cudaError_t status = cudaHostAlloc(&fresh[r], bytes, cudaHostAllocDefault);
+        if (status != cudaSuccess) {
+            if (fresh[0] != nullptr) { cudaFreeHost(fresh[0]); }
+            throw std::runtime_error(std::string("pinned relay: cudaHostAlloc failed: ") +
+                                     cudaGetErrorName(status) + ": " +
+                                     cudaGetErrorString(status));
+        }
+    }
+    for (int r = 0; r < 2; ++r) {
+        if (entry->bounce[r] != nullptr) { CUDA_CHECK(cudaFreeHost(entry->bounce[r])); }
+        entry->bounce[r] = fresh[r];
+    }
+    entry->bytes = bytes;
+    return entry->bounce[rank];
+}
+
+// Relay path selection, mirroring mailbox_transport()'s escape-hatch convention: eager stream
+// (never a capture), payload at/above kRelayMinBytes, NINFER_TP2_RELAY not "0"/"false", and no
+// peer access on the device pair (with P2P the staged pull is a direct DMA and already faster).
+bool pinned_relay_active(const ExecutionContext& ec, std::size_t bytes, cudaStream_t stream) {
+    if (bytes < kRelayMinBytes) { return false; }
+    static const bool disabled_by_environment = [] {
+        const char* value = std::getenv("NINFER_TP2_RELAY");
+        return value != nullptr &&
+               (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0);
+    }();
+    if (disabled_by_environment) { return false; }
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) { return false; }
+    if (status != cudaStreamCaptureStatusNone) { return false; }
+    static const bool peer_access = [&ec] {
+        int forward = 0;
+        int reverse = 0;
+        if (cudaDeviceCanAccessPeer(&forward, ec.dev[0]->device, ec.dev[1]->device) !=
+                cudaSuccess ||
+            cudaDeviceCanAccessPeer(&reverse, ec.dev[1]->device, ec.dev[0]->device) !=
+                cudaSuccess) {
+            return false;
+        }
+        return forward != 0 && reverse != 0;
+    }();
+    return !peer_access;
+}
+
 
 // MAILBOX TRANSPORT SELECTION. Returns the installed mailbox when every predicate holds:
 //
@@ -285,6 +403,41 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
                 mailbox->flag(1 - rank, slot), mailbox->arrival(rank) + slot,
                 mailbox->hang_word(), vecs);
             CUDA_CHECK(cudaGetLastError());
+        }
+        return;
+    }
+
+    // PINNED CE RELAY. Eager, prefill-sized, no-P2P collectives exchange through the pinned
+    // bounce buffers instead of the driver-staged pull; the arithmetic and the event contract
+    // are unchanged, so the observable result is identical bit for bit. See the transport note
+    // at pinned_relay_active().
+    if (pinned_relay_active(ec, bytes, ec.dev[0]->stream)) {
+        void* bounce[2] = {pinned_relay_bounce(ec, events, 0, bytes),
+                           pinned_relay_bounce(ec, events, 1, bytes)};
+        // Phase A: publish "bounce[r] holds my complete operand".
+        for (int rank = 0; rank < 2; ++rank) {
+            const DeviceContext& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            CUDA_CHECK(cudaMemcpyAsync(bounce[rank], buffer[rank].data, bytes,
+                                       cudaMemcpyDeviceToHost, local.stream));
+            CUDA_CHECK(cudaEventRecord(events.inputs_ready(rank), local.stream));
+        }
+        // Phase B: pull the peer's bounce buffer into own staging.
+        for (int rank = 0; rank < 2; ++rank) {
+            const DeviceContext& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.inputs_ready(1 - rank), 0));
+            CUDA_CHECK(cudaMemcpyAsync(staging[rank].data, bounce[1 - rank], bytes,
+                                       cudaMemcpyHostToDevice, local.stream));
+            CUDA_CHECK(cudaEventRecord(events.pull_done(rank), local.stream));
+        }
+        // Phase C: identical to the staged path (and the cross-call bounce[r] WAR barrier).
+        for (int rank = 0; rank < 2; ++rank) {
+            const DeviceContext& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.pull_done(1 - rank), 0));
+            Tensor accumulator = buffer[rank];
+            detail::residual_add_launch(staging[rank], accumulator, local.stream);
         }
         return;
     }

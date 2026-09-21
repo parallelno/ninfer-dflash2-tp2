@@ -45,6 +45,16 @@ repository root unless stated otherwise.
   `cudaFuncSetAttribute` as `small_t.cu`; replaced with `ensure_func_attr_per_device` so the
   prompt kernels launch on rank 1. Prefill 1.13K -> 1.35K tok/s, TTFT 5.8 -> 4.8-5.0 s at 6.6K
   prompt tokens (reference 1.41K / 4.7 s); outputs unchanged and deterministic.
+- **Pinned CE relay for prefill collectives** (`src/ops/common/allreduce.cu`). Prefill's eager
+  10 MiB `allreduce_sum` calls ran the driver-staged UVA pull at ~3.65 ms each (~65% of prefill
+  time). The same exchange hand-staged through pinned host bounce buffers (D2H publish + H2D
+  pull, identical 4-event `PeerEvents` choreography, identical `residual_add` combine) measures
+  ~3.29 ms in the production-linked microbench. The relay engages only for eager, >= 1 MiB,
+  no-P2P payloads (prefill chunks); captured call sites keep the mailbox and small eager payloads
+  keep the staged path. Escape hatch: `NINFER_TP2_RELAY=0`. Measured server-side (same binary,
+  env A/B, 1024-chunk sweep): 17.1K-prompt TTFT 12.36 -> 11.81 s, marginal prefill 0.691 ->
+  0.659 ms/token (**1,446 -> 1,518 tok/s, +5.0%**); bit-exact: identical SHA256 completion on an
+  8,392-token prompt with the relay on and off, and bench-dflash2 SHAs stable across rounds.
 - **DFlash2 weights on rank 0 only.** The `dflash2/*` objects (~2.07 GiB: 5 draft layers,
   feature projection, candidate-selector codebooks) were `Replicated` on both TP ranks, but the
   draft model only ever runs on rank 0 (`dflash_impl.h`; rank 1 receives drafts by memcpy). That

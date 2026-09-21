@@ -233,6 +233,16 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                                     std::optional<std::uint32_t> split_frontier,
                                                     bool finalize_at_end);
 
+// Wavefront prefill (prototype): pipelines the remaining prompt's chunks two at a time at layer
+// granularity (see prefill_text_wavefront in text_prefill_impl.h). Returns
+// processed_tokens == 0 when it does not apply; the caller falls back to prefill_text_chunk.
+[[nodiscard]] PrefillChunkResult prefill_text_wavefront(PrefillContext& state,
+                                                       std::span<const TokenId> ids,
+                                                       std::uint32_t nominal_length,
+                                                       bool finalize_at_end,
+                                                       std::span<const std::uint32_t>
+                                                           split_frontiers);
+
 [[nodiscard]] PrefillChunkResult
 prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
                          VisionPrefillSession& vision, std::uint32_t nominal_length,

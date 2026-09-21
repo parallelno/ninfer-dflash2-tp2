@@ -36,6 +36,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -1430,6 +1432,372 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                               .timing           = timing.finish()};
 }
 
+// Cross-chunk wavefront prefill (prototype, H18 in fork/research-prefill-improvements2.md).
+//
+// The chunk-to-chunk dependency is PER LAYER, not global: chunk k+1's layer-l attention needs
+// chunk k's K/V at layer l (written when chunk k's layer l ran), and its GDN state at layer l
+// likewise. So chunk k+1 may trail chunk k by one layer: while the leading chunk sits in a
+// layer's TP2 collectives (copy engines / host link busy, SMs idle), the trailing chunk runs the
+// previous layer's GEMMs on a second stream pair (SMs busy, link idle). This driver keeps two
+// slots in flight -- slot 0 (lead) on the DeviceContext streams, slot 1 (lag) on alternate
+// streams -- with per-layer event edges lead[l] -> lag[l], per-slot PeerEvents (the 4-event
+// collective protocol is not shareable between in-flight chunks), and per-slot DFlash sinks.
+//
+// Bit-exactness: every kernel and collective for a given chunk runs in the same order with the
+// same operands as the sequential path; only the ISSUE interleaving across chunks changes, and
+// the event edges enforce exactly the sequential cross-chunk dependencies.
+std::uint32_t TextContext::prefill_wavefront_tp2(std::span<const int> ids,
+                                                const TextPrefill& text_prefill,
+                                                bool finalize_at_end,
+                                                DFlashFeatureSink* sinks[2],
+                                                std::span<const std::uint32_t> split_frontiers) {
+    if (ids.empty()) { throw std::invalid_argument("TextContext::prefill requires tokens"); }
+    if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::overflow_error("TextContext::prefill token count exceeds int32");
+    }
+    if (text_kv_base_ != text_prefill.begin ||
+        text_prefill.token_ids.size() < static_cast<std::size_t>(text_kv_base_) + ids.size()) {
+        throw std::invalid_argument("text prefill chunk does not match its full prompt");
+    }
+    // Fallback conditions: the engine runs the sequential path instead.
+    static const bool wave_debug = std::getenv("NINFER_WAVE_DEBUG") != nullptr;
+    if (mtp_enabled() && io_.mtp.has_value()) {
+        if (wave_debug) { std::fprintf(stderr, "[wave] off: mtp prompt prep\n"); }
+        return 0;
+    }
+    if (rope_delta_ != 0) {
+        if (wave_debug) { std::fprintf(stderr, "[wave] off: rope delta\n"); }
+        return 0;
+    }
+    const int T     = static_cast<int>(ids.size());
+    const int chunk = static_cast<int>(prefill_chunk_);
+    // Chunk boundaries: the regular grid, additionally cut at every rewrite execution frontier
+    // (chat-template boundaries the GDN decomposition must match, exactly as the sequential
+    // path's split_frontier cuts its chunk). Frontiers are absolute prompt positions.
+    std::vector<int> chunk_start;
+    std::vector<int> chunk_len;
+    for (int pos = 0; pos < T;) {
+        int len = std::min(chunk, T - pos);
+        for (const std::uint32_t frontier : split_frontiers) {
+            const auto rel = static_cast<std::int64_t>(frontier) -
+                             static_cast<std::int64_t>(text_kv_base_);
+            if (rel > pos && rel < pos + len) { len = static_cast<int>(rel) - pos; }
+        }
+        chunk_start.push_back(pos);
+        chunk_len.push_back(len);
+        pos += len;
+    }
+    const int nchunks = static_cast<int>(chunk_start.size());
+    // Prototype gate: at least two chunks, none degenerate. Frontier-cut small chunks are legal
+    // (the sequential path splits identically) but sub-64-token chunks keep the sequential path
+    // (no overlap to win there anyway).
+    bool usable = nchunks >= 2;
+    for (int i = 0; usable && i < nchunks; ++i) {
+        if (chunk_len[static_cast<std::size_t>(i)] < 1) { usable = false; }
+    }
+    if (!usable) {
+        if (wave_debug) {
+            std::fprintf(stderr, "[wave] off: not usable (T=%d chunks=%d)\n", T, nchunks);
+        }
+        return 0;
+    }
+    if (static_cast<std::uint64_t>(text_kv_base_) + static_cast<std::uint64_t>(T) >
+        static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::overflow_error("TextContext::prefill absolute position exceeds int32");
+    }
+    const int base_i = static_cast<int>(text_kv_base_);
+
+    const ExecutionContext& execution       = ec();
+    const std::array<WorkspaceArena*, 2> ws = workspaces();
+    const int n_layers                      = kCfg.n_layers;
+
+    struct Slot {
+        int t0 = 0;
+        int len = 0;
+        std::array<Tensor, 2> x;
+        std::array<Tensor, 2> positions;
+        std::array<Tensor, 2> staging;
+        ops::CausalAttentionExecutionEnvelope envelope{0, 0};
+    };
+    Slot slot[2];
+
+    const TpExecution* const tp_original = tp_;
+    std::vector<std::array<cudaEvent_t, 2>> ev_layer(static_cast<std::size_t>(n_layers));
+    std::array<cudaEvent_t, 2> ev_done[2] = {{nullptr, nullptr}, {nullptr, nullptr}};
+    std::uint32_t processed               = 0;
+
+    // Restores every rebound member, synchronizes both devices, and releases the wavefront CUDA
+    // objects on any exit path (exceptions included).
+    struct Guard {
+        TextContext* self;
+        const TpExecution* tp_original;
+        std::vector<std::array<cudaEvent_t, 2>>& ev_layer;
+        std::array<cudaEvent_t, 2> (&ev_done)[2];
+        ~Guard() {
+            self->wave_slot_                             = -1;
+            self->tp_                                    = tp_original;
+            self->active_cache_positions_                = nullptr;
+            self->active_rope_positions_                 = nullptr;
+            self->active_causal_attention_envelope_      = nullptr;
+            self->peer_cache_positions_                  = nullptr;
+            self->peer_rope_positions_                   = nullptr;
+            self->peer_kv_table_rows_                    = nullptr;
+            try {
+                // Device-wide, not synchronize_all(): the alternate streams must also be drained
+                // before the caller's arena is reused by the next schedule.
+                for (int rank = 0; rank < 2; ++rank) {
+                    CUDA_CHECK(cudaSetDevice(self->ec().dev[rank]->device));
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                }
+            } catch (...) {
+            }
+            for (auto& pair : ev_layer) {
+                for (cudaEvent_t e : pair) {
+                    if (e != nullptr) { cudaEventDestroy(e); }
+                }
+            }
+            for (auto& per_slot : ev_done) {
+                for (cudaEvent_t e : per_slot) {
+                    if (e != nullptr) { cudaEventDestroy(e); }
+                }
+            }
+            for (cudaStream_t& s : self->wave_alt_stream_) { s = nullptr; }
+            self->wave_events_[0].reset();
+            self->wave_events_[1].reset();
+            if (self->wave_ec_slot1_.has_value() &&
+                std::getenv("NINFER_WAVE_SERIAL") != nullptr) {
+                // Serial bisect mode lent the PRIMARY streams to slot 1's DeviceContexts; their
+                // destructors must not destroy streams they do not own.
+                for (int rank = 0; rank < 2; ++rank) {
+                    self->wave_ec_slot1_->dev[rank]->stream = nullptr;
+                }
+            }
+            self->wave_ec_slot1_.reset();
+        }
+    } guard{this, tp_original, ev_layer, ev_done};
+
+    // Slot 1's ExecutionContext owns the alternate streams (created by its DeviceContexts);
+    // the Guard releases them by resetting the optional, never by cudaStreamDestroy.
+    {
+        const CurrentDevice restore;
+        wave_ec_slot1_.emplace(std::vector<int>{execution.dev[0]->device,
+                                                execution.dev[1]->device});
+        // NINFER_WAVE_SERIAL=1 (debug bisect): slot 1 shares the primary streams, so the
+        // wavefront issues in exactly the sequential order with no overlap.
+        static const bool wave_serial = std::getenv("NINFER_WAVE_SERIAL") != nullptr;
+        for (int rank = 0; rank < 2; ++rank) {
+            if (wave_serial) { wave_ec_slot1_->dev[rank]->stream = execution.dev[rank]->stream; }
+            wave_alt_stream_[rank] = wave_serial ? execution.dev[rank]->stream
+                                                 : wave_ec_slot1_->dev[rank]->stream;
+        }
+        for (int s = 0; s < 2; ++s) {
+            wave_events_[s].emplace(execution);
+            wave_tp_slot_[s]        = *tp_original;
+            wave_tp_slot_[s].events = &*wave_events_[s];
+        }
+        wave_tp_slot_[1].execution = &*wave_ec_slot1_;
+    }
+
+    for_each_rank(execution, [&](int rank) {
+        ops::set_i32_scalar(io_for(rank).rope_delta, 0, stream_for(rank));
+    });
+
+    work_.reset();
+    tp_->work->reset();
+
+    // Slot 1's DFlash sink must not share slot 0's capture buffers (the persistent
+    // prefill_features/positions): the two slots' capture_layer calls interleave. Clone the
+    // buffer SHAPES from the arena (which was just reset, so these live for the whole call) and
+    // repoint slot 1's sink at the clones.
+    std::array<Tensor, 2> sink1_clones;
+    if (sinks[1] != nullptr && sinks[1]->features != nullptr) {
+        const Tensor& f = *sinks[1]->features;
+        const Tensor& p = *sinks[1]->positions;
+        sink1_clones[0] = ws[0]->alloc(f.dtype, {f.ne[0], f.ne[1], f.ne[2], f.ne[3]});
+        sink1_clones[1] = ws[0]->alloc(p.dtype, {p.ne[0], p.ne[1], p.ne[2], p.ne[3]});
+        sinks[1]->features  = &sink1_clones[0];
+        sinks[1]->positions = &sink1_clones[1];
+    }
+
+    auto bind = [&](int sl) {
+        wave_slot_                         = sl;
+        tp_                                = &wave_tp_slot_[sl];
+        active_cache_positions_            = &slot[sl].positions[0];
+        active_rope_positions_             = &slot[sl].positions[0];
+        peer_cache_positions_              = &slot[sl].positions[1];
+        peer_rope_positions_               = &slot[sl].positions[1];
+        peer_kv_table_rows_                = &wave_tp_slot_[sl].io->text_kv_table_row;
+        active_causal_attention_envelope_  = &slot[sl].envelope;
+    };
+
+    // Prepares one chunk into a slot: arena roots, ids/positions upload, embedding. Throws on
+    // arena overflow; callers catch and degrade to the sequential path while no KV has been
+    // appended by the not-yet-started pair.
+    auto prepare = [&](int sl, int chunk_index) {
+        Slot& s    = slot[sl];
+        s.t0       = chunk_start[static_cast<std::size_t>(chunk_index)];
+        s.len      = chunk_len[static_cast<std::size_t>(chunk_index)];
+        wave_slot_ = sl;
+        std::array<Tensor, 2> ids_device;
+        for (std::size_t r = 0; r < 2; ++r) {
+            const auto roots =
+                workspace_recipe::text_prefill_roots<TextConfig>(*ws[r], s.len, 0, 0);
+            ids_device[r]  = roots.ids;
+            s.positions[r] = roots.positions;
+            s.x[r]         = roots.residual;
+            s.staging[r]   = ws[r]->alloc(DType::BF16, {kCfg.hidden, s.len});
+        }
+        for_each_rank(execution, [&](int rank) {
+            const auto r    = static_cast<std::size_t>(rank);
+            cudaStream_t st = stream_for(rank);
+            copy_i32(ids.data() + s.t0, ids_device[r], st);
+            ops::fill_i32_positions(s.positions[r], base_i + s.t0, st);
+            ops::embedding(ids_device[r], rank == 0 ? *embed_ : *embed_peer_, s.x[r], st);
+        });
+        const auto visible = static_cast<std::uint32_t>(base_i + s.t0 + s.len);
+        s.envelope         = {visible, visible};
+        if (sinks[sl] != nullptr) { sinks[sl]->begin(s.x[0]); }
+    };
+
+    // Chunk tail: final rmsnorm into a slot-own xf, feature capture, slot-done events, and (for
+    // the last chunk) logits + sampling. The primary streams are made to wait for the slot's
+    // streams first, because logits_tp2 / sampling / the sink consume launch there.
+    auto finish = [&](int sl) {
+        Slot& s = slot[sl];
+        bind(sl);
+        std::array<Tensor, 2> xf;
+        for (std::size_t r = 0; r < 2; ++r) {
+            xf[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, s.len});
+        }
+        for_each_rank(execution, [&](int rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            ops::rmsnorm(s.x[r], rank == 0 ? *final_norm_ : *final_norm_peer_, kCfg.rms_eps, true,
+                         xf[r], stream_for(rank));
+        });
+        if (sinks[sl] != nullptr) { sinks[sl]->capture_positions(s.positions[0], stream_for(0)); }
+        for (int rank = 0; rank < 2; ++rank) {
+            const CurrentDevice restore;
+            CUDA_CHECK(cudaSetDevice(execution.dev[rank]->device));
+            CUDA_CHECK(cudaEventRecord(ev_done[sl][rank], stream_for(rank)));
+            CUDA_CHECK(cudaStreamWaitEvent(execution.dev[rank]->stream, ev_done[sl][rank], 0));
+        }
+        const bool is_last = finalize_at_end && (s.t0 + s.len == T);
+        if (is_last) {
+            const std::array<Tensor, 2> last = {xf[0].slice(1, s.len - 1, 1),
+                                                xf[1].slice(1, s.len - 1, 1)};
+            Tensor logits      = matrix_window(io_.logits, 1);
+            Tensor peer_logits = matrix_window(tp_->io->logits, 1);
+            logits_tp2(last, logits, peer_logits);
+            const CurrentDevice restore;
+            CUDA_CHECK(cudaSetDevice(ctx_.device));
+            ops::set_i32_scalar(io_.pos, base_i + T, ctx_.stream);
+            ops::set_i32_scalar(io_.rope_pos, base_i + T, ctx_.stream);
+            if (sampling_config_ != nullptr) {
+                ops::sample(logits, io_.token, kCfg.token_domain, sampling_config_, io_.pos,
+                            ops::kSamplePurposePrefill, work_, ctx_.stream);
+            } else {
+                ops::argmax(logits, io_.token, kCfg.token_domain, ctx_.stream);
+            }
+        }
+        processed += static_cast<std::uint32_t>(s.len);
+    };
+
+    // First pair, with the arena-overflow escape hatch: nothing has appended KV yet, so a
+    // failure here degrades to the fully sequential path with processed == 0.
+    try {
+        prepare(0, 0);
+        if (nchunks > 1) { prepare(1, 1); }
+    } catch (const std::exception&) {
+        return 0;
+    }
+    if (wave_debug) {
+        std::fprintf(stderr, "[wave] engaged: T=%d chunk=%d chunks=%d lens=", T, chunk, nchunks);
+        for (int l : chunk_len) { std::fprintf(stderr, "%d,", l); }
+        std::fprintf(stderr, "\n");
+    }
+
+    for (std::size_t l = 0; l < ev_layer.size(); ++l) {
+        for (int rank = 0; rank < 2; ++rank) {
+            const CurrentDevice restore;
+            CUDA_CHECK(cudaSetDevice(execution.dev[rank]->device));
+            CUDA_CHECK(cudaEventCreateWithFlags(&ev_layer[l][rank], cudaEventDisableTiming));
+        }
+    }
+    for (int sl = 0; sl < 2; ++sl) {
+        for (int rank = 0; rank < 2; ++rank) {
+            const CurrentDevice restore;
+            CUDA_CHECK(cudaSetDevice(execution.dev[rank]->device));
+            CUDA_CHECK(cudaEventCreateWithFlags(&ev_done[sl][rank], cudaEventDisableTiming));
+        }
+    }
+
+    int first = 0;  // chunk index in slot 0 (lead)
+    while (first < nchunks) {
+        const bool have_lag = first + 1 < nchunks;
+        for (int l = 0; l < n_layers; ++l) {
+            bind(0);
+            run_one_layer_tp2(slot[0].x, Phase::Prefill, slot[0].staging, sinks[0], l);
+            for (int rank = 0; rank < 2; ++rank) {
+                const CurrentDevice restore;
+                CUDA_CHECK(cudaSetDevice(execution.dev[rank]->device));
+                CUDA_CHECK(cudaEventRecord(ev_layer[static_cast<std::size_t>(l)][rank],
+                                           stream_for(rank)));
+            }
+            if (have_lag && l > 0) {
+                for (int rank = 0; rank < 2; ++rank) {
+                    const CurrentDevice restore;
+                    CUDA_CHECK(cudaSetDevice(execution.dev[rank]->device));
+                    CUDA_CHECK(cudaStreamWaitEvent(
+                        wave_alt_stream_[rank], ev_layer[static_cast<std::size_t>(l - 1)][rank],
+                        0));
+                }
+                bind(1);
+                run_one_layer_tp2(slot[1].x, Phase::Prefill, slot[1].staging, sinks[1], l - 1);
+            }
+        }
+        finish(0);
+        if (sinks[0] != nullptr) { sinks[0]->consume_prefill_chunk(slot[0].len, false); }
+        if (!have_lag) { break; }
+        for (int rank = 0; rank < 2; ++rank) {
+            const CurrentDevice restore;
+            CUDA_CHECK(cudaSetDevice(execution.dev[rank]->device));
+            CUDA_CHECK(cudaStreamWaitEvent(
+                wave_alt_stream_[rank], ev_layer[static_cast<std::size_t>(n_layers - 1)][rank],
+                0));
+        }
+        bind(1);
+        run_one_layer_tp2(slot[1].x, Phase::Prefill, slot[1].staging, sinks[1], n_layers - 1);
+        finish(1);
+        if (sinks[1] != nullptr) { sinks[1]->consume_prefill_chunk(slot[1].len, false); }
+        first += 2;
+        try {
+            if (first < nchunks) { prepare(0, first); }
+            if (first + 1 < nchunks) { prepare(1, first + 1); }
+        } catch (const std::exception&) {
+            // Later pairs could not be staged (arena pressure). The completed chunks are fully
+            // consistent; the engine continues the remainder on the sequential path.
+            break;
+        }
+    }
+
+    return processed;
+}
+
+std::uint32_t TextContext::prefill_chunk_wavefront(std::span<const int> full_ids,
+                                                  std::uint32_t begin,
+                                                  std::uint32_t nominal_length,
+                                                  bool finalize_at_end,
+                                                  DFlashFeatureSink* sinks[2],
+                                                  std::span<const std::uint32_t> split_frontiers) {
+    if (begin >= full_ids.size() || nominal_length == 0 ||
+        nominal_length > full_ids.size() - begin) {
+        throw std::invalid_argument("text prefill chunk is outside the prompt");
+    }
+    const TextPrefill text_prefill{full_ids, begin};
+    return prefill_wavefront_tp2(full_ids.subspan(begin, nominal_length), text_prefill,
+                                 finalize_at_end, sinks, split_frontiers);
+}
+
 PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
                                               std::uint32_t nominal_length, bool finalize_at_end) {
     if (begin >= full_ids.size() || nominal_length == 0 ||
@@ -1922,64 +2290,70 @@ void TextContext::mlp_tail_tp2(const Tensor* post_norm_0, const Tensor* post_nor
     Variant::post_mixer(h, {m0.payload, m1.payload}, x, staging, ph, ws, execution, *tp_->events);
 }
 
+void TextContext::run_one_layer_tp2(std::array<Tensor, 2>& x, Phase ph,
+                                    const std::array<Tensor, 2>& staging,
+                                    DFlashFeatureSink* feature_sink, int layer) {
+    const bool prefill = ph == Phase::Prefill;
+    if (ModelConfig::is_full(layer)) {
+        const auto fidx     = static_cast<std::size_t>(ModelConfig::full_idx(layer));
+        const FullLayerW& a = full_.at(fidx);
+        const FullLayerW& b = full_peer_.at(fidx);
+        nvtx::ScopedRange layer_range(
+            prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull,
+            nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
+        {
+            nvtx::ScopedRange mixer_range(
+                prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention,
+                nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
+            auto scope_0 = work_.scope();
+            auto scope_1 = tp_->work->scope();
+            attn_mix_tp2(a, b, x, static_cast<int>(fidx), ph, staging);
+        }
+        {
+            nvtx::ScopedRange post_mixer_range(
+                prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
+                nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
+            auto scope_0 = work_.scope();
+            auto scope_1 = tp_->work->scope();
+            mlp_tail_tp2(a.post_attn_norm, b.post_attn_norm, a.mlp, b.mlp, x, ph, staging);
+            if (feature_sink != nullptr) {
+                feature_sink->capture_layer(layer, x[0], stream_for(0));
+            }
+        }
+    } else {
+        const auto gidx    = static_cast<std::size_t>(ModelConfig::gdn_idx(layer));
+        const GdnLayerW& a = gdn_.at(gidx);
+        const GdnLayerW& b = gdn_peer_.at(gidx);
+        nvtx::ScopedRange layer_range(prefill ? nvtx::Name::PrefillLayerGdn
+                                              : nvtx::Name::VerifyLayerGdn,
+                                      nvtx::Category::Gdn, static_cast<std::uint64_t>(layer));
+        {
+            nvtx::ScopedRange mixer_range(
+                prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn, nvtx::Category::Gdn,
+                static_cast<std::uint64_t>(layer));
+            auto scope_0 = work_.scope();
+            auto scope_1 = tp_->work->scope();
+            gdn_mix_tp2(a, b, x, static_cast<int>(gidx), ph, staging);
+        }
+        {
+            nvtx::ScopedRange post_mixer_range(
+                prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
+                nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
+            auto scope_0 = work_.scope();
+            auto scope_1 = tp_->work->scope();
+            mlp_tail_tp2(a.post_attn_norm, b.post_attn_norm, a.mlp, b.mlp, x, ph, staging);
+            if (feature_sink != nullptr) {
+                feature_sink->capture_layer(layer, x[0], stream_for(0));
+            }
+        }
+    }
+}
+
 void TextContext::run_layers_tp2(std::array<Tensor, 2>& x, Phase ph,
                                  const std::array<Tensor, 2>& staging,
                                  DFlashFeatureSink* feature_sink) {
-    const bool prefill = ph == Phase::Prefill;
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
-        if (ModelConfig::is_full(layer)) {
-            const auto fidx     = static_cast<std::size_t>(ModelConfig::full_idx(layer));
-            const FullLayerW& a = full_.at(fidx);
-            const FullLayerW& b = full_peer_.at(fidx);
-            nvtx::ScopedRange layer_range(
-                prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull,
-                nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
-            {
-                nvtx::ScopedRange mixer_range(
-                    prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention,
-                    nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
-                auto scope_0 = work_.scope();
-                auto scope_1 = tp_->work->scope();
-                attn_mix_tp2(a, b, x, static_cast<int>(fidx), ph, staging);
-            }
-            {
-                nvtx::ScopedRange post_mixer_range(
-                    prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
-                    nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
-                auto scope_0 = work_.scope();
-                auto scope_1 = tp_->work->scope();
-                mlp_tail_tp2(a.post_attn_norm, b.post_attn_norm, a.mlp, b.mlp, x, ph, staging);
-                if (feature_sink != nullptr) {
-                    feature_sink->capture_layer(layer, x[0], ctx_.stream);
-                }
-            }
-        } else {
-            const auto gidx    = static_cast<std::size_t>(ModelConfig::gdn_idx(layer));
-            const GdnLayerW& a = gdn_.at(gidx);
-            const GdnLayerW& b = gdn_peer_.at(gidx);
-            nvtx::ScopedRange layer_range(prefill ? nvtx::Name::PrefillLayerGdn
-                                                  : nvtx::Name::VerifyLayerGdn,
-                                          nvtx::Category::Gdn, static_cast<std::uint64_t>(layer));
-            {
-                nvtx::ScopedRange mixer_range(
-                    prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn, nvtx::Category::Gdn,
-                    static_cast<std::uint64_t>(layer));
-                auto scope_0 = work_.scope();
-                auto scope_1 = tp_->work->scope();
-                gdn_mix_tp2(a, b, x, static_cast<int>(gidx), ph, staging);
-            }
-            {
-                nvtx::ScopedRange post_mixer_range(
-                    prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
-                    nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
-                auto scope_0 = work_.scope();
-                auto scope_1 = tp_->work->scope();
-                mlp_tail_tp2(a.post_attn_norm, b.post_attn_norm, a.mlp, b.mlp, x, ph, staging);
-                if (feature_sink != nullptr) {
-                    feature_sink->capture_layer(layer, x[0], ctx_.stream);
-                }
-            }
-        }
+        run_one_layer_tp2(x, ph, staging, feature_sink, layer);
     }
 }
 

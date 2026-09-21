@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -266,6 +267,17 @@ public:
                                                    std::uint32_t begin,
                                                    std::uint32_t nominal_length,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
+    // Wavefront prototype entry (H18, fork/research-prefill-improvements2.md): processes ALL
+    // `nominal_length` tokens with two chunks in flight. Returns the number of tokens completed
+    // (0 = does not apply; the caller falls back to prefill_chunk for the remainder).
+    [[nodiscard]] std::uint32_t prefill_chunk_wavefront(std::span<const int> full_ids,
+                                                       std::uint32_t begin,
+                                                       std::uint32_t nominal_length,
+                                                       bool finalize_at_end,
+                                                       DFlashFeatureSink* sinks[2],
+                                                       std::span<const std::uint32_t>
+                                                           split_frontiers);
+
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
@@ -366,6 +378,9 @@ private:
     [[nodiscard]] const ExecutionContext& ec() const;
     [[nodiscard]] std::array<WorkspaceArena*, 2> workspaces() const;
     [[nodiscard]] cudaStream_t stream_for(int rank) const noexcept {
+        // Wavefront slot 1 runs on the alternate per-rank streams (see prefill_wavefront_tp2);
+        // slot 0 and every non-wavefront caller keep the DeviceContext streams.
+        if (wave_slot_ == 1) { return wave_alt_stream_[rank]; }
         return rank == 0 ? ctx_.stream : tp_->device->stream;
     }
     [[nodiscard]] qwen3_6::RoundState& io_for(int rank) const noexcept {
@@ -396,6 +411,11 @@ private:
     void run_layers_tp2(std::array<Tensor, 2>& x, Phase phase,
                         const std::array<Tensor, 2>& staging,
                         DFlashFeatureSink* feature_sink = nullptr);
+    // One layer of the tp2 schedule (mixer + MLP tail + optional feature capture). Extracted from
+    // run_layers_tp2 so the wavefront driver can interleave two chunks at layer granularity.
+    void run_one_layer_tp2(std::array<Tensor, 2>& x, Phase phase,
+                           const std::array<Tensor, 2>& staging,
+                           DFlashFeatureSink* feature_sink, int layer);
     // Vocabulary-split head: each rank computes its own half of the logits, then one allgather
     // per column leaves the FULL logits on both ranks. Sampling then runs on rank 0 alone.
     void logits_tp2(const std::array<Tensor, 2>& hidden, Tensor& logits,
@@ -503,6 +523,20 @@ private:
                                                       bool finalize_at_end,
                                                       DFlashFeatureSink* feature_sink,
                                                       const MultimodalPrefill* multimodal);
+    // Cross-chunk wavefront prefill (prototype; see fork/research-prefill-improvements2.md H18).
+    // Processes ALL of `ids` in `prefill_chunk_` pieces with two chunks in flight: the trailing
+    // chunk's layer l-1 compute overlaps the leading chunk's layer l collectives. Text-only, no
+    // MTP prompt prep, no rewrite checkpoints; the engine falls back to prefill_impl_tp2 for
+    // anything else. `sinks[s]` (may be null) is slot s's own DFlash feature sink -- slot
+    // capture buffers must be disjoint. Returns 0 without touching device state when the
+    // wavefront cannot start (e.g. the arena cannot hold two chunks); the caller then runs the
+    // sequential path.
+    [[nodiscard]] std::uint32_t prefill_wavefront_tp2(std::span<const int> ids,
+                                                     const TextPrefill& text_prefill,
+                                                     bool finalize_at_end,
+                                                     DFlashFeatureSink* sinks[2],
+                                                     std::span<const std::uint32_t>
+                                                         split_frontiers);
     DeviceContext& ctx_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;
@@ -552,6 +586,18 @@ private:
     std::array<ops::RopeFrequencyOverride, kTensorParallelWidth> rope_frequency_{};
 
     const TpExecution* tp_                       = nullptr;
+    // Wavefront state (prefill_wavefront_tp2 only). wave_slot_ < 0 means inactive. Slot 1 owns
+    // the alternate per-rank streams; each slot owns a PeerEvents pair (collectives of two
+    // in-flight chunks must not share the 4-event protocol) and a TpExecution copy pointing at
+    // it. tp_ is rebound to the active slot's copy for the duration of that slot's launches.
+    int wave_slot_                                 = -1;
+    cudaStream_t wave_alt_stream_[2]               = {nullptr, nullptr};
+    TpExecution wave_tp_slot_[2]{};
+    std::optional<ops::PeerEvents> wave_events_[2];
+    // Slot 1's ExecutionContext: same devices, but its DeviceContexts carry the alternate
+    // streams, so slot 1's split-projection wrappers (which launch on ec.dev[r]->stream) stay
+    // stream-ordered with slot 1's compute instead of racing slot 0 on the primary streams.
+    std::optional<ExecutionContext> wave_ec_slot1_;
     const Tensor* peer_cache_positions_          = nullptr;
     const Tensor* peer_rope_positions_           = nullptr;
     const Tensor* peer_kv_table_rows_            = nullptr;

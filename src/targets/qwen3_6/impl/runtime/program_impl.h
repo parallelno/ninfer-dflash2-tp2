@@ -11937,6 +11937,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             std::uint32_t remaining          = nominal;
             std::uint32_t final_chunk_tokens = 0;
             bool finalized                   = false;
+            bool wavefront_failed            = false;
             while (remaining != 0) {
                 schedule_state.text_kv_base           = staged.cursor;
                 selectors                             = state_selectors(sequence);
@@ -11975,9 +11976,38 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                                                                 *staged.vision, remaining,
                                                                 split_frontier, final_candidate);
                 } else {
-                    result = schedule::prefill_text_chunk(
-                        schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
-                        remaining, split_frontier, final_candidate);
+                    // Wavefront prototype (H18, fork/research-prefill-improvements2.md): hand the
+                    // whole remaining prompt to the layer-pipelined driver when nothing this
+                    // iteration needs the per-chunk features it does not implement (MTP prompt
+                    // prep, rewrite/capture frontiers, an outstanding MTP bridge). Disabled with
+                    // NINFER_WAVEFRONT=0. A 0-token result (or a partial one) falls through to
+                    // the ordinary per-chunk path for the rest.
+                    static const bool wavefront_enabled = [] {
+                        const char* value = std::getenv("NINFER_WAVEFRONT");
+                        return value == nullptr ||
+                               (std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0);
+                    }();
+                    if (wavefront_enabled && !wavefront_failed && !staged.prepare_mtp &&
+                        staged.mtp_bridge == MtpBridgeMode::None &&
+                        staged.next_capture >= staged.capture_groups.size()) {
+                        result = schedule::prefill_text_wavefront(
+                            schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
+                            staged.prompt_tokens - staged.cursor, final_candidate,
+                            staged.prompt.identity.rewrite_execution_frontiers);
+                        if (result.processed_tokens == 0) { wavefront_failed = true; }
+                    } else if (wavefront_enabled && std::getenv("NINFER_WAVE_DEBUG") != nullptr) {
+                        std::fprintf(stderr,
+                                     "[wave] engine skip: prepare_mtp=%d bridge=%d "
+                                     "captures=%zu/%zu failed=%d\n",
+                                     staged.prepare_mtp ? 1 : 0,
+                                     static_cast<int>(staged.mtp_bridge), staged.next_capture,
+                                     staged.capture_groups.size(), wavefront_failed ? 1 : 0);
+                    }
+                    if (result.processed_tokens == 0) {
+                        result = schedule::prefill_text_chunk(
+                            schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
+                            remaining, split_frontier, final_candidate);
+                    }
                 }
                 timing.include(result.timing);
                 timing.resume_post();
