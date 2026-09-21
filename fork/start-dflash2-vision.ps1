@@ -3,7 +3,7 @@ param(
     [int]$Port = 30000,
     # measured: 105,000 fits with -VisionDevice 1 -MaxVisionTokens 1024 (200 MiB free on rank 0);
     # the old dual-replicated 16384-token layout capped out at ~51K
-    [int]$MaxContext = 110080,
+    [int]$MaxContext = 110000,
     [int]$DraftTokens = 4,
     [int]$Timeout = 600000,
     [int]$KvCapacity = 0,
