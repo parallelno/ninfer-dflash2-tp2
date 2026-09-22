@@ -129,7 +129,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--vision-device N] [--max-vision-tokens N] [--no-cuda-graph] "
-           "[--no-prefix-reuse] "
+           "[--no-prefix-reuse] [--prefill-pipeline] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -158,6 +158,9 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       --prefill-pipeline (tp 2 only) runs each prefill chunk as two staggered token "
+           "halves so one half's all-reduce overlaps the other's compute; adds one half-chunk "
+           "workspace per rank\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
@@ -380,6 +383,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--max-vision-tokens must be in [1,16384]");
             }
             options.max_vision_tokens = static_cast<std::uint32_t>(tokens);
+        } else if (arg == "--prefill-pipeline") {
+            options.prefill_pipeline = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {

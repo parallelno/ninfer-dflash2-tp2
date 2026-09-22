@@ -1,9 +1,10 @@
 param(
     [string]$modelId = 'qwen-dflash2-vision',
     [int]$Port = 30000,
-    # measured: 105,000 fits with -VisionDevice 1 -MaxVisionTokens 1024 (200 MiB free on rank 0);
-    # the old dual-replicated 16384-token layout capped out at ~51K
-    [int]$MaxContext = 110000,
+    # measured: 105,000 fits with -VisionDevice 1 -MaxVisionTokens 1024 plus the --prefill-pipeline
+    # lane (~60 MiB on rank 0; preflight reports ~105.6K as the ceiling). Without the pipeline
+    # 110,000 fits; the old dual-replicated 16384-token vision layout capped out at ~51K.
+    [int]$MaxContext = 105000,
     [int]$DraftTokens = 4,
     [int]$Timeout = 600000,
     [int]$KvCapacity = 0,
@@ -24,6 +25,16 @@ param(
     # planner evicts the only retained checkpoint before the next turn) while still paying
     # ~0.65 s of checkpoint-capture work per request. See fork/research/prefill/README.md.
     [switch]$DefaultContextCache,
+    # Escape hatches for before/after comparison of the two prefill accelerators (both on by
+    # default; see fork/research/prefill/README.md §8 for the measurements):
+    #   -NoPrefillPipeline  drops --prefill-pipeline (two staggered token halves per chunk on two
+    #                       stream lanes; marginal prefill 1,444 -> 1,602 tok/s, +11%; costs
+    #                       ~60 MiB on rank 0, i.e. ~4K tokens of context on 16 GB cards)
+    #   -NoRelay            drops NINFER_TP2_RELAY=1 (pinned-host bounce transport for the eager
+    #                       prefill collectives; with the pipeline 1,602 -> 1,774 tok/s, +23%
+    #                       total; bit-identical outputs to the staged transport)
+    [switch]$NoPrefillPipeline,
+    [switch]$NoRelay,
     [switch]$NoCudaGraph
 )
 
@@ -94,8 +105,18 @@ if ($PrefillChunk -gt 0) {
     $arguments += @('--prefill-chunk', $PrefillChunk)
 }
 
+if (-not $NoPrefillPipeline) {
+    $arguments += '--prefill-pipeline'
+}
+
 if ($NoCudaGraph) {
     $arguments += '--no-cuda-graph'
+}
+
+if ($NoRelay) {
+    Remove-Item Env:NINFER_TP2_RELAY -ErrorAction SilentlyContinue
+} else {
+    $env:NINFER_TP2_RELAY = '1'
 }
 
 & $server @arguments

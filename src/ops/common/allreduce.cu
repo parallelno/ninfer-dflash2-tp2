@@ -31,6 +31,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -66,6 +69,96 @@ std::uint8_t* byte_offset(void* base, std::size_t offset) {
 cudaError_t pull_peer(void* destination, const void* source, std::size_t bytes,
                       cudaStream_t stream) {
     return cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDeviceToDevice, stream);
+}
+
+// PINNED CE RELAY (opt-in, NINFER_TP2_RELAY=1). On a no-P2P pair the driver's internal staging
+// of the cudaMemcpyAsync(D2D/UVA) pull above measures ~3.5 ms per 10 MiB reduction and blocks the
+// ISSUING HOST THREAD for ~45% of that time (fork/research/prefill: issue_bench). Hand-staging
+// the same exchange through pinned host bounce buffers -- D2H on the owner's stream, H2D pull on
+// the peer's -- measures ~3.2 ms with the identical four-event choreography and identical local
+// combine, and returns to the host in ~25 us. Eager, >= 1 MiB payloads only (prefill chunks);
+// captured call sites keep the mailbox, small eager payloads the staged path.
+//
+// PeerEvents contract with shifted meanings: inputs_ready[r] = "bounce[r] holds rank r's complete
+// operand" (recorded after the D2H); pull_done[r] = "rank r's H2D out of the peer's bounce is
+// complete". The phase-C wait on pull_done[1-r] orders both the in-place combine AND the next
+// call's D2H overwrite of bounce[r] after the peer's read -- the same write-after-read argument
+// as the staged path. Bounce buffers are therefore keyed by the PeerEvents instance: two lanes
+// issuing collectives concurrently (--prefill-pipeline) each own a pair, and each pair is
+// guarded by its own instance's protocol.
+constexpr std::size_t kRelayMinBytes = 1u << 20;
+
+struct PinnedRelayEntry {
+    const void* key   = nullptr;
+    void* bounce[2]   = {nullptr, nullptr};
+    std::size_t bytes = 0;
+};
+constexpr std::size_t kRelayEntries = 4;
+std::mutex g_relay_mutex;
+PinnedRelayEntry g_relay[kRelayEntries];
+
+// Grow-only per-key bounce pair. Growth (or key replacement) synchronizes both devices first so
+// no in-flight copy still references buffers being released; growth happens at most a handful of
+// times per process (chunk widths are quantized) and never inside a steady-state prefill.
+void* relay_bounce(const ExecutionContext& ec, const PeerEvents& events, int rank,
+                   std::size_t bytes) {
+    std::lock_guard<std::mutex> lock(g_relay_mutex);
+    const void* key         = &events;
+    PinnedRelayEntry* entry = nullptr;
+    PinnedRelayEntry* spare = nullptr;
+    for (PinnedRelayEntry& candidate : g_relay) {
+        if (candidate.key == key) { entry = &candidate; }
+        if (candidate.key == nullptr && spare == nullptr) { spare = &candidate; }
+    }
+    if (entry == nullptr) {
+        if (spare == nullptr) {
+            throw std::runtime_error("pinned relay: more concurrent PeerEvents than relay slots");
+        }
+        entry      = spare;
+        entry->key = key;
+    }
+    if (entry->bytes >= bytes) { return entry->bounce[rank]; }
+    for (int r = 0; r < 2; ++r) {
+        CUDA_CHECK(cudaSetDevice(ec.dev[r]->device));
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    void* fresh[2] = {nullptr, nullptr};
+    for (int r = 0; r < 2; ++r) {
+        const cudaError_t status = cudaHostAlloc(&fresh[r], bytes, cudaHostAllocPortable);
+        if (status != cudaSuccess) {
+            if (fresh[0] != nullptr) { (void)cudaFreeHost(fresh[0]); }
+            throw std::runtime_error(std::string("pinned relay: cudaHostAlloc failed: ") +
+                                     cudaGetErrorName(status) + ": " + cudaGetErrorString(status));
+        }
+    }
+    for (int r = 0; r < 2; ++r) {
+        if (entry->bounce[r] != nullptr) { (void)cudaFreeHost(entry->bounce[r]); }
+        entry->bounce[r] = fresh[r];
+    }
+    entry->bytes = bytes;
+    return entry->bounce[rank];
+}
+
+bool relay_active(const ExecutionContext& ec, std::size_t bytes, cudaStream_t stream) {
+    if (bytes < kRelayMinBytes) { return false; }
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_TP2_RELAY");
+        return value != nullptr && (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0);
+    }();
+    if (!enabled) { return false; }
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) { return false; }
+    if (status != cudaStreamCaptureStatusNone) { return false; }
+    static const bool peer_access = [&ec] {
+        int forward = 0;
+        int reverse = 0;
+        if (cudaDeviceCanAccessPeer(&forward, ec.dev[0]->device, ec.dev[1]->device) != cudaSuccess ||
+            cudaDeviceCanAccessPeer(&reverse, ec.dev[1]->device, ec.dev[0]->device) != cudaSuccess) {
+            return false;
+        }
+        return forward != 0 && reverse != 0;
+    }();
+    return !peer_access;  // with P2P the staged pull is a direct DMA and already faster
 }
 
 // MAILBOX TRANSPORT SELECTION. Returns the installed mailbox when every predicate holds:
@@ -289,6 +382,45 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
         return;
     }
 
+    // PINNED CE RELAY (see relay_active). Same events, same combine, same bytes; only the
+    // transport differs, so the observable result is identical bit for bit to the staged path.
+    if (relay_active(ec, bytes, ec.dev[0]->stream)) {
+        void* bounce[2] = {relay_bounce(ec, events, 0, bytes), relay_bounce(ec, events, 1, bytes)};
+        for (int rank = 0; rank < 2; ++rank) {
+            const DeviceContext& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            CUDA_CHECK(cudaMemcpyAsync(bounce[rank], buffer[rank].data, bytes,
+                                       cudaMemcpyDeviceToHost, local.stream));
+            CUDA_CHECK(cudaEventRecord(events.inputs_ready(rank), local.stream));
+        }
+        for (int rank = 0; rank < 2; ++rank) {
+            const DeviceContext& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.inputs_ready(1 - rank), 0));
+            CUDA_CHECK(cudaMemcpyAsync(staging[rank].data, bounce[1 - rank], bytes,
+                                       cudaMemcpyHostToDevice, local.stream));
+            CUDA_CHECK(cudaEventRecord(events.pull_done(rank), local.stream));
+        }
+        for (int rank = 0; rank < 2; ++rank) {
+            const DeviceContext& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.pull_done(1 - rank), 0));
+            Tensor accumulator = buffer[rank];
+            detail::residual_add_launch(staging[rank], accumulator, local.stream);
+        }
+        return;
+    }
+
+    // DIAGNOSTIC ONLY (NINFER_TP2_DIAG_NO_TRANSFER=1): skip the cross-device pull and combine
+    // each rank's partial with its own stale staging buffer. Output is numerically WRONG; the
+    // purpose is to measure the compute-only prefill time of the eager TP2 schedule so the
+    // collective share can be measured in the server instead of extrapolated from a microbench.
+    // Event choreography is kept so the two streams stay ordered exactly as in production.
+    static const bool diag_no_transfer = [] {
+        const char* value = std::getenv("NINFER_TP2_DIAG_NO_TRANSFER");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+
     // Phase A: publish "my operand is complete" on each stream, before any wait observes it.
     for (int rank = 0; rank < 2; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
@@ -302,7 +434,9 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
         const DeviceContext& local = *ec.dev[rank];
         CurrentDeviceGuard::set(local.device);
         CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.inputs_ready(1 - rank), 0));
-        CUDA_CHECK(pull_peer(staging[rank].data, buffer[1 - rank].data, bytes, local.stream));
+        if (!diag_no_transfer) {
+            CUDA_CHECK(pull_peer(staging[rank].data, buffer[1 - rank].data, bytes, local.stream));
+        }
         CUDA_CHECK(cudaEventRecord(events.pull_done(rank), local.stream));
     }
 

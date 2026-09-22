@@ -171,6 +171,60 @@ Caveats measured in the same benches:
    (capture from the tail hidden instead of running a separate 7‑token chunk): ~0.13 s per
    request with reuse on. Touches `advance_prefill`.
 
+## 8. Implemented: `--prefill-pipeline` and the pinned relay (2026‑09‑21)
+
+Both are optional so before/after runs can be made on the same binary.
+
+**`--prefill-pipeline`** (server flag → `EngineOptions::prefill_pipeline`, tp 2 only). Each
+eager prefill chunk ≥ 256 tokens is split into a leading half A and a trailing half B. A runs on
+the ordinary per‑rank streams; B runs on a second lane — a second `ExecutionContext` on the same
+two devices (= second compute stream per rank), its own `PeerEvents`, and a per‑rank arena sized
+for a half‑chunk layer body (`WorkspacePlan::prefill_pipeline_lane`, ~60 MiB on rank 0 at chunk
+1024). Issue order `A(0) A(1)B(0) A(2)B(1) … A(63)B(62) B(63)`; B(l) waits on a per‑parity event
+recorded after A(l) (it reads A's K/V rows and continues A's GDN state, so B reads/writes the
+chunk's *destination* slot while A reads *source* → *destination*). Rank‑0 join before the final
+norm. Multimodal chunks and tails < 256 tokens take the plain loop. Implementation:
+`TextContext::run_layers_tp2_pipelined` (`text_context_impl.h`), lane storage
+`ProgramImplCore::PrefillPipelineStorage` (`program_impl.h`), the layer body now takes its
+streams/events/arenas from the *active lane* accessors (`ec()`, `peer_events()`, `workspaces()`).
+
+**`NINFER_TP2_RELAY=1`** (env, opt‑in). Eager ≥ 1 MiB `allreduce_sum` payloads exchange through
+pinned host bounce buffers (D2H on the owner stream, H2D pull on the peer) instead of the
+driver‑staged UVA `cudaMemcpyAsync`. Same 4‑event protocol, same combine kernel; bounce pairs are
+keyed by `PeerEvents` instance so the two lanes never share one. Main effect: the issuing host
+thread no longer blocks ~45 % of each copy (§5), which is what lets the pipeline's second lane
+actually get issued ahead.
+
+Measured (`--no-prefix-reuse`, 5‑point sweep 545–16,844 tokens, linear fit; all servers same
+binary, back to back):
+
+| config | fixed | ms/tok | marginal tok/s | vs baseline | 16.8K TTFT |
+|---|---:|---:|---:|---:|---:|
+| baseline (staged, no pipeline) | 0.138 s | 0.693 | 1,444 | — | 11.90 s |
+| relay only | 0.168 | 0.667 | 1,498 | +4 % | 11.37 |
+| pipeline only | 0.154 | 0.624 | 1,602 | **+11 %** | 10.78 |
+| **pipeline + relay** | 0.158 | 0.564 | **1,774** | **+23 %** | **9.75** |
+| pipeline + relay, chunk 2048 (needs ≤ 64K ctx) | 0.213 | 0.553 | 1,809 | +25 % | — |
+| pipeline, transfers disabled (ceiling) | 0.132 | 0.261 | 3,835 | — | — |
+
+GPU during a 16K prefill: util 82–85 %, power 84 → 94 W (was 88 % / 84 W) — the SMs now do work
+during the copies. The gain is below the 92–95 % overlap the microbench showed because the
+pipeline only overlaps B(l−1)'s *compute* with A(l)'s *collective*; the two halves' own
+collectives still serialize on the same PCIe links and each half's GEMMs run at half width.
+
+**Numerics.** Pipeline runs are deterministic (two servers, four prompts, identical greedy
+output). Relay vs staged is bit‑identical (same four prompts). Pipeline vs no‑pipeline is *not*
+bit‑identical: the halves run the GEMMs at width 512 instead of 1024, and NVFP4 GEMM tile
+schedules differ by width — the same effect as `--prefill-chunk 512` vs 1024 without the
+pipeline (measured: 2 of 4 prompts differ between chunk 512 and 1024 on the unmodified path;
+pipeline‑1024 matches chunk‑512 on 2 of 4). This is last‑bit BF16 drift amplified by greedy
+decoding, of the class the tp2 path already carries.
+
+**End‑to‑end** (`fork/start-dflash2-vision2.ps1` defaults: pipeline + relay + reuse flags,
+DFlash2 K=4, 106K context): cold 6.2K‑token agent turn TTFT 4.7 → 3.8 s; cold 4.2K prompt
+3.4 → 2.6 s; reuse hits unchanged at 0.46–0.62 s; vision requests run the plain loop and work.
+The lane costs ~60 MiB on rank 0, so `--max-context` drops from 110,000 to ~106,000 on 16 GB (105,000 with the vision tower).
+
 ## Reproduce
 
 ```powershell
@@ -179,6 +233,8 @@ Caveats measured in the same benches:
 .\start-server.ps1 -Tag noreuse -Port 30006 -NoPrefixReuse
 .\start-server.ps1 -Tag nt -Port 30006 -NoPrefixReuse -Env @{ NINFER_TP2_DIAG_NO_TRANSFER='1' }
 .\start-server.ps1 -Tag reuse -Port 30006 -MaxContext 110000 -Extra @('--max-private-continuations','1','--max-shared-prefixes','0','--max-long-anchors-per-continuation','0')
+.\start-server.ps1 -Tag pipe -Port 30006 -NoPrefixReuse -Extra @('--prefill-pipeline') -Env @{ NINFER_TP2_RELAY='1' }   # §8
+.\compare-outputs.ps1 -Port 30006 -Tag pipe        # greedy outputs for A/B numerics (out\outputs-<tag>.json)
 .\sweep.ps1 -Port 30006 -Tag base -TargetTokens @(64,512,1024,2048,4096,8192,16384) -Distinct
 .\report.ps1 -Tags base,noreuse,nt              # per-request table + linear fit from the JSONL
 .\gpu-sample.ps1 -Port 30006 -Tokens 16384      # nvidia-smi util/power during one prefill

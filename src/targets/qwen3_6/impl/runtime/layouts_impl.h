@@ -692,6 +692,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
                   out.dflash_context, out.dflash_round, out.causal_score});
     out.capacity = out.general_capacity;
+    if (plan.tp == 2 && plan.prefill_pipeline) {
+        // The trailing half-chunk lane runs only the layer BODY (mixer + post-mixer stages) over
+        // at most ceil(chunk/2) tokens; its residual, staging and roots live in the primary arena.
+        const std::int32_t half = std::max<std::int32_t>(1, (chunk + 1) / 2);
+        WorkspaceLayoutBuilder lane;
+        target_body(lane, 1, half, qwen3_6::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1, 1,
+                    half, text_envelope);
+        out.prefill_pipeline_lane = finish(lane);
+    }
     if (plan.features.vision) {
         const std::uint32_t merged = static_cast<std::uint32_t>(std::min<std::uint64_t>(
             {plan.capacity, kMaximumVisionItemTokens, plan.features.max_vision_item_tokens}));
@@ -795,6 +804,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->yarn_origin         = inputs.yarn_origin;
     impl->effective_max_context = inputs.effective_max_context;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
+    impl->prefill_pipeline    = inputs.prefill_pipeline && inputs.tp == 2;
     impl->causal_scoring      = inputs.causal_scoring;
     impl->device              = inputs.device;
     impl->tp                  = inputs.tp;
@@ -874,6 +884,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->device_reservation_bytes = checked_add(
         checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
         impl->graph_allowance_bytes, "sequence graph allowance");
+    impl->device_reservation_bytes =
+        checked_add(impl->device_reservation_bytes, impl->workspace.prefill_pipeline_lane,
+                    "prefill pipeline lane");
     return impl;
 }
 
@@ -894,6 +907,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .proposal_head       = options.speculative.proposal_head,
         .features            = qwen3_6::startup_features(options),
         .use_cuda_graph      = options.use_cuda_graph,
+        .prefill_pipeline    = options.prefill_pipeline,
         .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
         .device              = options.device,
         .tp                  = options.tp,

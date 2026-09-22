@@ -56,6 +56,7 @@ struct ServeOptions {
     int vision_device       = -1; // -1: rank 0's device
     std::uint32_t max_vision_tokens = 0; // 0: compiled ceiling (16384 merged tokens per item)
     bool use_cuda_graph     = true;
+    bool prefill_pipeline   = false; // --prefill-pipeline: tp2 two-lane staggered prefill chunks
     bool allow_prefix_reuse = true;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)

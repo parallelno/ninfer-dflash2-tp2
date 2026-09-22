@@ -206,6 +206,11 @@ struct EngineOptions {
     // is planned for exactly this extent, so a small N frees device memory for KV.
     std::uint32_t max_vision_tokens        = 0;
     bool use_cuda_graph                    = true;
+    // tp == 2 only: run each eager prefill chunk as two token halves on two stream lanes,
+    // staggered by one layer, so one half's row-parallel all-reduce (host-staged PCIe copy on a
+    // no-P2P pair) overlaps the other half's GEMMs. Same kernels and per-token op order; costs one
+    // extra half-chunk workspace per rank. Ignored at tp == 1.
+    bool prefill_pipeline                  = false;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;

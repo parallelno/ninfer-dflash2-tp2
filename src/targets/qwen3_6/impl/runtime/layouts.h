@@ -64,6 +64,9 @@ struct WorkspacePlan {
     std::size_t dflash_context   = 0;
     std::size_t dflash_round     = 0;
     std::size_t causal_score     = 0;
+    // tp2 --prefill-pipeline: per-rank arena for the second (trailing) half-chunk lane. Zero
+    // when the feature is off or tp == 1. Allocated OUTSIDE general_capacity.
+    std::size_t prefill_pipeline_lane = 0;
     std::size_t general_capacity = 0;
     std::optional<VisionWorkspacePlan> vision;
     std::size_t capacity = 0;
@@ -90,6 +93,7 @@ struct SequencePlanningInputs {
     // `yarn_origin * yarn_factor` under Yarn.
     std::uint32_t effective_max_context = 0;
     bool use_cuda_graph = true;
+    bool prefill_pipeline = false;
     bool causal_scoring = false;
     int device          = 0;
     int tp              = 1;
@@ -119,6 +123,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t yarn_origin           = 0;
     std::uint32_t effective_max_context = 0;
     bool use_cuda_graph = true;
+    bool prefill_pipeline = false;
     bool causal_scoring = false;
     int device          = 0;
     int tp              = 1;

@@ -237,6 +237,12 @@ TextContext::TextContext(
         if (mtp_enabled() != (tp_->mtp_kv.valid() || tp_->batch_mtp_kv != nullptr)) {
             throw std::invalid_argument("tensor-parallel MTP storage disagrees between ranks");
         }
+        if (tp_->pipeline != nullptr && !tp_->pipeline->complete()) {
+            throw std::invalid_argument("tensor-parallel prefill pipeline lane is incomplete");
+        }
+        lane_execution_ = tp_->execution;
+        lane_events_    = tp_->events;
+        lane_work_      = {&work_, tp_->work};
     }
     if (prefill_chunk_ == 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -1534,10 +1540,15 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_6::PreparedPromptData&
 
 const ExecutionContext& TextContext::ec() const {
     if (tp_ == nullptr) { throw std::logic_error("TextContext has no tensor-parallel context"); }
-    return *tp_->execution;
+    return *lane_execution_;
 }
 
-std::array<WorkspaceArena*, 2> TextContext::workspaces() const { return {&work_, tp_->work}; }
+std::array<WorkspaceArena*, 2> TextContext::workspaces() const { return lane_work_; }
+
+const ops::PeerEvents& TextContext::peer_events() const {
+    if (tp_ == nullptr) { throw std::logic_error("TextContext has no tensor-parallel context"); }
+    return *lane_events_;
+}
 
 void TextContext::synchronize_all() const {
     ctx_.synchronize();
@@ -1723,7 +1734,7 @@ void TextContext::attn_mix_tp2(const FullLayerW& w0, const FullLayerW& w1, std::
 
     Variant::attention_output_projection({a[0].view({kShardQSize, T}), a[1].view({kShardQSize, T})},
                                          {*w0.o_proj, *w1.o_proj}, x, staging, ph, ws, execution,
-                                         *tp_->events);
+                                         peer_events());
 }
 
 void TextContext::gdn_mix_tp2(const GdnLayerW& w0, const GdnLayerW& w1, std::array<Tensor, 2>& x,
@@ -1901,7 +1912,7 @@ void TextContext::gdn_mix_tp2(const GdnLayerW& w0, const GdnLayerW& w1, std::arr
 
     Variant::gdn_output_projection(
         {on[0].view({kShardValueDim, T}), on[1].view({kShardValueDim, T})},
-        {*w0.out_proj, *w1.out_proj}, x, staging, ph, ws, execution, *tp_->events);
+        {*w0.out_proj, *w1.out_proj}, x, staging, ph, ws, execution, peer_events());
 }
 
 void TextContext::mlp_tail_tp2(const Tensor* post_norm_0, const Tensor* post_norm_1, const MlpW& m0,
@@ -1919,7 +1930,7 @@ void TextContext::mlp_tail_tp2(const Tensor* post_norm_0, const Tensor* post_nor
         const auto r = static_cast<std::size_t>(rank);
         ops::rmsnorm(x[r], *norm[r], kCfg.rms_eps, true, h[r], stream_for(rank));
     });
-    Variant::post_mixer(h, {m0.payload, m1.payload}, x, staging, ph, ws, execution, *tp_->events);
+    Variant::post_mixer(h, {m0.payload, m1.payload}, x, staging, ph, ws, execution, peer_events());
 }
 
 void TextContext::run_layers_tp2(std::array<Tensor, 2>& x, Phase ph,
@@ -1938,19 +1949,19 @@ void TextContext::run_layers_tp2(std::array<Tensor, 2>& x, Phase ph,
                 nvtx::ScopedRange mixer_range(
                     prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention,
                     nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
-                auto scope_0 = work_.scope();
-                auto scope_1 = tp_->work->scope();
+                auto scope_0 = lane_work_[0]->scope();
+                auto scope_1 = lane_work_[1]->scope();
                 attn_mix_tp2(a, b, x, static_cast<int>(fidx), ph, staging);
             }
             {
                 nvtx::ScopedRange post_mixer_range(
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
-                auto scope_0 = work_.scope();
-                auto scope_1 = tp_->work->scope();
+                auto scope_0 = lane_work_[0]->scope();
+                auto scope_1 = lane_work_[1]->scope();
                 mlp_tail_tp2(a.post_attn_norm, b.post_attn_norm, a.mlp, b.mlp, x, ph, staging);
                 if (feature_sink != nullptr) {
-                    feature_sink->capture_layer(layer, x[0], ctx_.stream);
+                    feature_sink->capture_layer(layer, x[0], stream_for(0));
                 }
             }
         } else {
@@ -1964,23 +1975,192 @@ void TextContext::run_layers_tp2(std::array<Tensor, 2>& x, Phase ph,
                 nvtx::ScopedRange mixer_range(
                     prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn, nvtx::Category::Gdn,
                     static_cast<std::uint64_t>(layer));
-                auto scope_0 = work_.scope();
-                auto scope_1 = tp_->work->scope();
+                auto scope_0 = lane_work_[0]->scope();
+                auto scope_1 = lane_work_[1]->scope();
                 gdn_mix_tp2(a, b, x, static_cast<int>(gidx), ph, staging);
             }
             {
                 nvtx::ScopedRange post_mixer_range(
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
-                auto scope_0 = work_.scope();
-                auto scope_1 = tp_->work->scope();
+                auto scope_0 = lane_work_[0]->scope();
+                auto scope_1 = lane_work_[1]->scope();
                 mlp_tail_tp2(a.post_attn_norm, b.post_attn_norm, a.mlp, b.mlp, x, ph, staging);
                 if (feature_sink != nullptr) {
-                    feature_sink->capture_layer(layer, x[0], ctx_.stream);
+                    feature_sink->capture_layer(layer, x[0], stream_for(0));
                 }
             }
         }
     }
+}
+
+// --prefill-pipeline layer loop (tp == 2, Phase::Prefill only).
+//
+// The chunk's T tokens are split into a leading half A = [0, ta) and a trailing half B = [ta, T).
+// A runs on the PRIMARY lane (the ordinary per-rank streams), B on the PIPELINE lane (a second
+// stream per rank with its own PeerEvents and scratch). The issue order is
+//
+//     A(0)  A(1) B(0)  A(2) B(1)  ...  A(63) B(62)  B(63)
+//
+// so while A(l)'s row-parallel all-reduces (host-staged PCIe copies, the majority of prefill time
+// on a no-P2P pair) are in flight on the primary streams, B(l-1)'s GEMMs run on the lane streams
+// of the same devices. The two halves never share a workspace byte: A allocates from the primary
+// arenas, B from the lane arenas; the residual and reduce staging are column-disjoint slices.
+//
+// DEPENDENCIES. B(l) reads what A(l) wrote to persistent state: A's K/V rows (B's queries attend
+// A's keys) and the GDN conv/recurrent slot (B continues A's recurrence). Hence B(l) waits on
+// primary_done[l%2], recorded after A(l). A(l+1) touches only layer l+1's state, so A never
+// waits on B inside the chunk; the chunk-end join (lane_done) orders the final norm and the
+// next chunk after B(63). Per-parity events suffice because B(l)'s wait is enqueued before
+// A(l+2) re-records the same parity, and cudaStreamWaitEvent snapshots the record it saw.
+//
+// STATE SLOTS. A reads the chunk's `source` slot and writes `destination` (the fork-on-first-
+// write the caller arranged). B must continue from A's result, so B reads AND writes
+// `destination`. The GDN recurrence over A-then-B tokens is the recurrence over the whole chunk
+// evaluated by the same kernel at the same per-token precision, in two calls.
+//
+// ATTENTION. Both halves append their own K/V rows at their own positions; B's envelope is the
+// full chunk's visible-key count because B attends A's rows too (appended at layer l already).
+//
+// NUMERICS. Per token every op runs the same kernel in the same layer order over the same
+// inputs as the single-pass schedule; only the token partition of each launch differs. The
+// result matches the unpipelined chunk up to the GEMM's per-launch tile schedule -- the same
+// class of last-bit drift the tp2 path already carries relative to tp1.
+void TextContext::run_layers_tp2_pipelined(std::array<Tensor, 2>& x,
+                                           const std::array<Tensor, 2>& staging,
+                                           const std::array<Tensor, 2>& positions,
+                                           std::int32_t base, DFlashFeatureSink* feature_sink) {
+    const PrefillPipelineLane& lane = *tp_->pipeline;
+    const ExecutionContext& primary = *tp_->execution;
+    const int T                     = x[0].ne[1];
+    const int ta                    = (T + 1) / 2;
+    const int tb                    = T - ta;
+    if (tb <= 0) {
+        run_layers_tp2(x, Phase::Prefill, staging, feature_sink);
+        return;
+    }
+    std::array<Tensor, 2> xa, xb, sa, sb, pa, pb;
+    for (std::size_t r = 0; r < 2; ++r) {
+        xa[r] = x[r].slice(1, 0, ta);
+        xb[r] = x[r].slice(1, ta, tb);
+        sa[r] = staging[r].slice(1, 0, ta);
+        sb[r] = staging[r].slice(1, ta, tb);
+        pa[r] = positions[r].slice(0, 0, ta);
+        pb[r] = positions[r].slice(0, ta, tb);
+    }
+    const auto visible_a = static_cast<std::uint32_t>(base + ta);
+    const auto visible_b = static_cast<std::uint32_t>(base + T);
+    const ops::CausalAttentionExecutionEnvelope envelope_a{visible_a, visible_a};
+    const ops::CausalAttentionExecutionEnvelope envelope_b{visible_b, visible_b};
+
+    struct HalfBinding {
+        const ExecutionContext* execution;
+        const ops::PeerEvents* events;
+        std::array<WorkspaceArena*, 2> work;
+        std::array<Tensor, 2>* residual;
+        const std::array<Tensor, 2>* staging;
+        const std::array<Tensor, 2>* positions;
+        const ops::CausalAttentionExecutionEnvelope* envelope;
+        std::int32_t source_slot;
+    };
+    const HalfBinding half_a{&primary, tp_->events, {&work_, tp_->work}, &xa, &sa, &pa,
+                             &envelope_a, linear_state_source_slot_};
+    const HalfBinding half_b{lane.execution, lane.events, lane.work, &xb, &sb, &pb, &envelope_b,
+                             linear_state_destination_slot_};
+    // The lane streams must not start before the primary streams have produced the chunk's
+    // residual (embedding + scatter were issued on the primary streams before this call).
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r = static_cast<std::size_t>(rank);
+        CUDA_CHECK(cudaEventRecord(lane.lane_done[r][0], primary.dev[r]->stream));
+        CUDA_CHECK(cudaStreamWaitEvent(lane.execution->dev[r]->stream, lane.lane_done[r][0], 0));
+    }
+
+    const auto run_step = [&](const HalfBinding& half, int layer, bool capture_features) {
+        lane_execution_ = half.execution;
+        lane_events_    = half.events;
+        lane_work_      = half.work;
+        ScopedValue<const Tensor*> cache0(active_cache_positions_, &(*half.positions)[0]);
+        ScopedValue<const Tensor*> rope0(active_rope_positions_, &(*half.positions)[0]);
+        ScopedValue<const Tensor*> cache1(peer_cache_positions_, &(*half.positions)[1]);
+        ScopedValue<const Tensor*> rope1(peer_rope_positions_, &(*half.positions)[1]);
+        ScopedValue<const ops::CausalAttentionExecutionEnvelope*> env(
+            active_causal_attention_envelope_, half.envelope);
+        ScopedValue<std::int32_t> src(linear_state_source_slot_, half.source_slot);
+        std::array<Tensor, 2>& xr       = *half.residual;
+        const std::array<Tensor, 2>& sr = *half.staging;
+        if (ModelConfig::is_full(layer)) {
+            const auto fidx     = static_cast<std::size_t>(ModelConfig::full_idx(layer));
+            const FullLayerW& a = full_.at(fidx);
+            const FullLayerW& b = full_peer_.at(fidx);
+            {
+                auto scope_0 = lane_work_[0]->scope();
+                auto scope_1 = lane_work_[1]->scope();
+                attn_mix_tp2(a, b, xr, static_cast<int>(fidx), Phase::Prefill, sr);
+            }
+            {
+                auto scope_0 = lane_work_[0]->scope();
+                auto scope_1 = lane_work_[1]->scope();
+                mlp_tail_tp2(a.post_attn_norm, b.post_attn_norm, a.mlp, b.mlp, xr, Phase::Prefill,
+                             sr);
+            }
+        } else {
+            const auto gidx    = static_cast<std::size_t>(ModelConfig::gdn_idx(layer));
+            const GdnLayerW& a = gdn_.at(gidx);
+            const GdnLayerW& b = gdn_peer_.at(gidx);
+            {
+                auto scope_0 = lane_work_[0]->scope();
+                auto scope_1 = lane_work_[1]->scope();
+                gdn_mix_tp2(a, b, xr, static_cast<int>(gidx), Phase::Prefill, sr);
+            }
+            {
+                auto scope_0 = lane_work_[0]->scope();
+                auto scope_1 = lane_work_[1]->scope();
+                mlp_tail_tp2(a.post_attn_norm, b.post_attn_norm, a.mlp, b.mlp, xr, Phase::Prefill,
+                             sr);
+            }
+        }
+        if (capture_features && feature_sink != nullptr) {
+            // Issued on the lane stream after B(layer); the lane already waited on A(layer), so
+            // the full-width residual for this layer is complete when the copy runs.
+            feature_sink->capture_layer(layer, x[0], stream_for(0));
+        }
+    };
+    const auto record_primary = [&](int layer) {
+        const auto parity = static_cast<std::size_t>(layer & 1);
+        for (int rank = 0; rank < 2; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            CUDA_CHECK(cudaEventRecord(lane.primary_done[r][parity], primary.dev[r]->stream));
+        }
+    };
+    const auto lane_wait_primary = [&](int layer) {
+        const auto parity = static_cast<std::size_t>(layer & 1);
+        for (int rank = 0; rank < 2; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            CUDA_CHECK(cudaStreamWaitEvent(lane.execution->dev[r]->stream,
+                                           lane.primary_done[r][parity], 0));
+        }
+    };
+
+    for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+        run_step(half_a, layer, false);
+        record_primary(layer);
+        if (layer > 0) {
+            lane_wait_primary(layer - 1);
+            run_step(half_b, layer - 1, true);
+        }
+    }
+    lane_wait_primary(kCfg.n_layers - 1);
+    run_step(half_b, kCfg.n_layers - 1, true);
+
+    // Join: the primary streams (final norm, logits, sampling, next chunk) wait for B(63).
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r = static_cast<std::size_t>(rank);
+        CUDA_CHECK(cudaEventRecord(lane.lane_done[r][1], lane.execution->dev[r]->stream));
+        CUDA_CHECK(cudaStreamWaitEvent(primary.dev[r]->stream, lane.lane_done[r][1], 0));
+    }
+    lane_execution_ = tp_->execution;
+    lane_events_    = tp_->events;
+    lane_work_      = {&work_, tp_->work};
 }
 
 void TextContext::logits_tp2(const std::array<Tensor, 2>& hidden, Tensor& logits,
@@ -2183,7 +2363,16 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
         const ops::CausalAttentionExecutionEnvelope chunk_envelope{visible, visible};
         ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, chunk_envelope);
 
-        run_layers_tp2(x, Phase::Prefill, staging, feature_sink);
+        // --prefill-pipeline: two staggered token halves on two stream lanes (see
+        // run_layers_tp2_pipelined). Below 256 tokens the halves are too small to hide anything
+        // behind and the extra launches only cost host time, so short tails take the plain loop.
+        // Multimodal chunks carry 3-axis rope positions and scattered visual rows; they keep the
+        // plain loop (the pipelined loop rebinds one [T] position vector for both cache and rope).
+        if (tp_->pipeline != nullptr && len >= 256 && multimodal == nullptr) {
+            run_layers_tp2_pipelined(x, staging, positions, base_i, feature_sink);
+        } else {
+            run_layers_tp2(x, Phase::Prefill, staging, feature_sink);
+        }
         if (feature_sink != nullptr) {
             feature_sink->capture_positions(positions[0], ctx_.stream);
         }

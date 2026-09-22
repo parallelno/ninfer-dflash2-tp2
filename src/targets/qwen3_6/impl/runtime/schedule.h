@@ -81,6 +81,8 @@ struct TpPeerCore {
     // Enrolls rank 1's stream in rank 0's capture. Null when graphs are disabled; the eager path
     // never reads it.
     const DecodeGraphPeerBridge* graph_bridge = nullptr;
+    // --prefill-pipeline lane; null when the feature is off.
+    const PrefillPipelineLane* prefill_pipeline = nullptr;
 };
 
 struct ExecutionCore {
@@ -108,6 +110,7 @@ struct ExecutionCore {
     TpExecution out;
     out.execution      = peer.execution;
     out.events         = peer.events;
+    out.pipeline       = peer.prefill_pipeline;
     out.device         = peer.device;
     out.weights        = peer.model;
     out.work           = peer.work;
