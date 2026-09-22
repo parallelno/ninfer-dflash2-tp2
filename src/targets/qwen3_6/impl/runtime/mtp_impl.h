@@ -321,15 +321,72 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                         ar_positions, ar_rope_positions, ar_valid_columns,
                                         static_cast<std::int32_t>(state.text_cache.max_context()),
                                         state.execution.device.stream);
-            card.mtp_forward_decode_batch(alignment_ids, target_hidden, target_positions,
-                                          target_rope, licensed_counts, mtp_rows, envelopes.batch,
-                                          alignment_hidden);
+            if (peer_round) {
+                // The accept runs ONCE, on rank 0, and updates `anchors`, `frontiers` and
+                // `licensed_counts` in place there only; `accepted` is already mirrored. Those
+                // three are outputs of the accept, not fields of the ingress, so rank 1 cannot
+                // derive them: mirror them, then re-run the same deterministic
+                // mtp_prepare_next_round on the peer's copy of the round.
+                const ops::PeerEvents& events = *tp->events;
+                CUDA_CHECK(cudaEventRecord(events.inputs_ready(0), state.execution.device.stream));
+                const CurrentDevice restore;
+                CUDA_CHECK(cudaSetDevice(tp->device->device));
+                CUDA_CHECK(cudaStreamWaitEvent(tp->device->stream, events.inputs_ready(0), 0));
+                const auto mirror = [&](const Tensor& destination, const Tensor& source) {
+                    CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, source.bytes(),
+                                               cudaMemcpyDeviceToDevice, tp->device->stream));
+                };
+                mirror(peer_round->anchors, anchors);
+                mirror(peer_round->frontiers, frontiers);
+                mirror(peer_round->licensed_counts, licensed_counts);
+                ops::mtp_prepare_next_round(
+                    peer_round->verify_ids, peer_round->anchors, peer_round->accepted,
+                    peer_round->frontiers, peer_round->budgets, peer_round->licensed_counts,
+                    peer_round->rope_deltas, peer_round->alignment_ids, peer_round->next_extents,
+                    peer_round->ar_positions, peer_round->ar_rope_positions,
+                    peer_round->ar_valid_columns,
+                    static_cast<std::int32_t>(state.text_cache.max_context()),
+                    tp->device->stream);
+            }
+
+            // The MTP head is SHARDED at tp2 (input_projection is row-parallel), so the one-rank
+            // overloads cannot run here: mtp_forward_stem would pack the whole [2*hidden,T] fc
+            // input and hand it to a [hidden,hidden] shard (the "[K,T] x [N,K]" failure at
+            // warm-up). The tp2 twins -- already used by the tp2 MTP prefill -- feed
+            // linear_row_parallel the two unpacked halves instead.
+            if (peer_round) {
+                card.mtp_forward_decode_batch(alignment_ids,
+                                              {target_hidden, peer_round->target_hidden},
+                                              {target_positions, peer_round->target_positions},
+                                              {target_rope, peer_round->target_rope},
+                                              {licensed_counts, peer_round->licensed_counts},
+                                              {mtp_rows, peer_round->mtp_rows}, envelopes.batch,
+                                              {alignment_hidden, peer_round->alignment_hidden});
+            } else {
+                card.mtp_forward_decode_batch(alignment_ids, target_hidden, target_positions,
+                                              target_rope, licensed_counts, mtp_rows,
+                                              envelopes.batch, alignment_hidden);
+            }
             ops::speculative_select_accepted_hidden(alignment_hidden, accepted, ar_hidden,
                                                     state.execution.device.stream);
+            if (peer_round) {
+                const CurrentDevice restore;
+                CUDA_CHECK(cudaSetDevice(tp->device->device));
+                ops::speculative_select_accepted_hidden(peer_round->alignment_hidden,
+                                                        peer_round->accepted, peer_round->ar_hidden,
+                                                        tp->device->stream);
+            }
 
             Tensor proposal_logits = frame.proposal_logits.slice(1, 0, batch_size);
             Tensor draft0          = next_drafts.slice(1, 0, 1).view({batch_size});
-            card.mtp_propose_batch(ar_hidden, proposal_logits, draft0);
+            // proposal_argmax_tp2 writes the winning ids on rank 0 only: next_drafts is an egress
+            // tensor and only rank 0's egress is read back; rank 1 never reads its own draft ids.
+            if (peer_round) {
+                card.mtp_propose_batch({ar_hidden, peer_round->ar_hidden},
+                                       {proposal_logits, peer_round->proposal_logits}, draft0);
+            } else {
+                card.mtp_propose_batch(ar_hidden, proposal_logits, draft0);
+            }
             for (std::uint32_t step = 0; step + 1 < k; ++step) {
                 Tensor previous =
                     next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
@@ -344,9 +401,39 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                 Tensor previous_batch    = previous.view({1, batch_size});
                 Tensor hidden_batch      = ar_hidden.view({TextConfig::hidden, 1, batch_size});
                 Tensor next_hidden_batch = next_hidden.view({TextConfig::hidden, 1, batch_size});
-                card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
-                                              mtp_rows, envelopes.ar[step], next_hidden_batch);
-                card.mtp_propose_batch(next_hidden, proposal_logits, next);
+                if (peer_round) {
+                    const auto s = static_cast<std::int32_t>(step);
+                    Tensor peer_position = peer_round->ar_positions.slice(1, s, 1)
+                                               .view({1, batch_size});
+                    Tensor peer_rope     = peer_round->ar_rope_positions.slice(1, s, 1)
+                                               .view({1, batch_size});
+                    Tensor peer_valid    = peer_round->ar_valid_columns.slice(1, s, 1)
+                                               .view({batch_size});
+                    Tensor peer_hidden_batch =
+                        peer_round->ar_hidden.view({TextConfig::hidden, 1, batch_size});
+                    Tensor peer_next_hidden_batch =
+                        peer_round->next_hidden.view({TextConfig::hidden, 1, batch_size});
+                    card.mtp_forward_decode_batch(previous_batch,
+                                                  {hidden_batch, peer_hidden_batch},
+                                                  {position, peer_position}, {rope, peer_rope},
+                                                  {valid, peer_valid},
+                                                  {mtp_rows, peer_round->mtp_rows},
+                                                  envelopes.ar[step],
+                                                  {next_hidden_batch, peer_next_hidden_batch});
+                    card.mtp_propose_batch({next_hidden, peer_round->next_hidden},
+                                           {proposal_logits, peer_round->proposal_logits}, next);
+                    const CurrentDevice restore;
+                    CUDA_CHECK(cudaSetDevice(tp->device->device));
+                    CUDA_CHECK(cudaMemcpyAsync(peer_round->ar_hidden.data,
+                                               peer_round->next_hidden.data,
+                                               peer_round->ar_hidden.bytes(),
+                                               cudaMemcpyDeviceToDevice, tp->device->stream));
+                } else {
+                    card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope,
+                                                  valid, mtp_rows, envelopes.ar[step],
+                                                  next_hidden_batch);
+                    card.mtp_propose_batch(next_hidden, proposal_logits, next);
+                }
                 CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
                                            cudaMemcpyDeviceToDevice,
                                            state.execution.device.stream));

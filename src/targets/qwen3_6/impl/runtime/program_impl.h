@@ -12494,6 +12494,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeMtpWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
+            // With the tp2 MTP decode the peer's last op is no longer followed by a collective.
+            if (peer) { peer->device.synchronize(); }
         }
         timing.end_wait();
 
