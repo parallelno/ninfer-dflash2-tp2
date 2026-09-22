@@ -543,6 +543,23 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         }
     }
 
+    // tp2 (P3-3a): a zero-suffix reuse would have to sample the bonus token from the restored
+    // hidden with sample_from_hidden (text_prefill_impl.h), whose GEMM uses model.output_head --
+    // at tp2 that is the vocabulary-split HALF of the head, and the backstop there is reachable
+    // (HTTP 500 measured 22/09). Decline the candidate: it costs one full prefill instead of a
+    // failed request. Remove once sample_from_hidden gains a logits_tp2 path.
+    if (peer.has_value() && plan->reuse != ReusePath::Root &&
+        plan->reuse_base >= plan->summary.prompt_tokens) {
+        return std::nullopt;
+    }
+    // tp2 + MTP (P3-0): mtp_bridge_and_propose throws for EVERY non-root reuse at tp2 because the
+    // bridge resumes the MTP head from a retained target hidden that only rank 0 owns. Decline
+    // here, where declining costs one extra prefill instead of a failed request.
+    if (peer.has_value() && speculative_backend == SpeculativeBackend::Mtp &&
+        plan->reuse != ReusePath::Root) {
+        return std::nullopt;
+    }
+
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const bool append_ready =
             plan->reuse == ReusePath::PrivateEndpoint && source != nullptr &&
@@ -556,7 +573,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             ((source != nullptr && source->mtp_kv_valid >= plan->reuse_base - 1) ||
              (shared_source != nullptr && shared_source->backend_frontier >= plan->reuse_base - 1));
         if (plan->reuse != ReusePath::Root && !append_ready && !checkpoint_ready) {
-            throw std::logic_error("published MTP checkpoint is not materializable");
+            return std::nullopt;   // a non-materializable catalog entry is a miss, not a fault
         }
     }
 
@@ -570,7 +587,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
          (shared_source != nullptr &&
           (!shared_source->kv || (backend_kv_cache() && !shared_source->kv->backend) ||
            shared_source->frontier < plan->reuse_base)))) {
-        throw std::logic_error("published DFlash checkpoint is not materializable");
+        return std::nullopt;   // a non-materializable catalog entry is a miss, not a fault
     }
 
     const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;
