@@ -768,6 +768,48 @@ PeerRuntime::PeerRuntime(DeviceContext& peer_device, const LoadedModelData& peer
     token_counts   = plan.persistent.token_counts.bind(backing);
 }
 
+ProgramImplCore::PrefillPipelineStorage::PrefillPipelineStorage(const ExecutionContext& primary,
+                                                                std::size_t lane_bytes)
+    : execution(std::vector<int>{primary.dev[0]->device, primary.dev[1]->device}),
+      events(execution) {
+    // ExecutionContext's constructor leaves device 0 current; each arena and its fence events
+    // must be created with THEIR device current.
+    int previous = 0;
+    CUDA_CHECK(cudaGetDevice(&previous));
+    try {
+        for (std::size_t r = 0; r < 2; ++r) {
+            CUDA_CHECK(cudaSetDevice(execution.dev[r]->device));
+            arenas[r].emplace(std::max<std::size_t>(lane_bytes, 256));
+            for (std::size_t parity = 0; parity < 2; ++parity) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&lane.primary_done[r][parity],
+                                                    cudaEventDisableTiming));
+                CUDA_CHECK(cudaEventCreateWithFlags(&lane.lane_done[r][parity],
+                                                    cudaEventDisableTiming));
+            }
+            lane.work[r] = &*arenas[r];
+        }
+    } catch (...) {
+        (void)cudaSetDevice(previous);
+        throw;
+    }
+    CUDA_CHECK(cudaSetDevice(previous));
+    lane.execution = &execution;
+    lane.events    = &events;
+}
+
+ProgramImplCore::PrefillPipelineStorage::~PrefillPipelineStorage() {
+    for (std::size_t r = 0; r < 2; ++r) {
+        for (std::size_t parity = 0; parity < 2; ++parity) {
+            if (lane.primary_done[r][parity] != nullptr) {
+                (void)cudaEventDestroy(lane.primary_done[r][parity]);
+            }
+            if (lane.lane_done[r][parity] != nullptr) {
+                (void)cudaEventDestroy(lane.lane_done[r][parity]);
+            }
+        }
+    }
+}
+
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
                                                                  const LoadedModelData* peer_model, const SequencePlanImpl& plan,
                                                                  ExecutionContext& execution_in,
@@ -858,6 +900,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
         CUDA_CHECK(cudaSetDevice(previous));
         (void)ops::enable_peer_access(execution);
         peer_events.emplace(execution);
+        if (plan.prefill_pipeline) {
+            prefill_pipeline.emplace(execution, plan.workspace.prefill_pipeline_lane);
+        }
         if (plan.use_cuda_graph) {
             // Created once, here, for the same reason PeerEvents is: cudaEventCreate is not
             // capturable, and the fork/join pair must outlive every capture.
@@ -1190,7 +1235,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
                                                .mtp_host_ingress = mtp_peer_host_ingress,
                                                .dflash_host_ingress = dflash_peer_host_ingress,
                                                .graph_bridge = graph_bridge ? &*graph_bridge
-                                                                            : nullptr});
+                                                                            : nullptr,
+                                               .prefill_pipeline = prefill_pipeline
+                                                                       ? &prefill_pipeline->lane
+                                                                       : nullptr});
         if (peer->replay_records.has_value() != replay_records.has_value()) {
             throw std::logic_error("peer ReplaySSM records do not match rank 0's");
         }

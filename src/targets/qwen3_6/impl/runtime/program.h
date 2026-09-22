@@ -716,6 +716,22 @@ public:
     std::optional<ops::PeerMailbox> peer_mailbox;
     // Created once at tp2 when graphs are on; forks rank 1's stream into rank 0's capture.
     std::optional<DecodeGraphPeerBridge> graph_bridge;
+    // --prefill-pipeline (tp 2): owns the second stream lane -- a second ExecutionContext on the
+    // same two device ids (its DeviceContexts create the lane's compute streams), the lane's own
+    // PeerEvents, one arena per rank sized by WorkspacePlan::prefill_pipeline_lane, and the
+    // per-rank/per-parity fence events. Created once here; the TextContext only borrows it.
+    struct PrefillPipelineStorage {
+        PrefillPipelineStorage(const ExecutionContext& primary, std::size_t lane_bytes);
+        ~PrefillPipelineStorage();
+        PrefillPipelineStorage(const PrefillPipelineStorage&)            = delete;
+        PrefillPipelineStorage& operator=(const PrefillPipelineStorage&) = delete;
+
+        ExecutionContext execution;
+        ops::PeerEvents events;
+        std::array<std::optional<DeviceArena>, 2> arenas;
+        schedule::PrefillPipelineLane lane;
+    };
+    std::optional<PrefillPipelineStorage> prefill_pipeline;
     std::optional<schedule::TpPeerCore> peer_core;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::unique_ptr<HostKVArena> host_kv_arena;

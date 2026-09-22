@@ -251,6 +251,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.vision_device            = options_.vision_device;
     engine_options.max_vision_tokens        = options_.max_vision_tokens;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
+    engine_options.prefill_pipeline         = options_.prefill_pipeline;
     engine_options.speculative              = options_.speculative;
     engine_options.context_cache            = options_.context_cache;
     engine_options.context_cost.preset_path = options_.context_cost_presets;

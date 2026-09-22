@@ -177,9 +177,30 @@ class VisionPrefillSession;
 // is its own bookkeeping: page allocation, lane state, sampling and the host round buffers all
 // live once, on rank 0, and rank 1's pools are driven through the identical call sequence so its
 // block tables match rank 0's by construction.
+// tp == 2 --prefill-pipeline: the second execution lane a prefill chunk's trailing token half
+// runs on. `execution` holds a second DeviceContext (= a second compute stream) per device, on
+// the SAME two devices as the primary ExecutionContext; `events` is that lane's own PeerEvents
+// (the collective protocol is per-lane, not shared); `work[r]` is rank r's lane arena, sized by
+// WorkspacePlan::prefill_pipeline_lane. `fence[r][k]` are per-rank, per-layer-parity events
+// used to order half B's layer l after half A's layer l (KV rows / GDN state written by A) and
+// half A's layer l+2 after half B's layer l (the GDN slot both halves update in sequence).
+struct PrefillPipelineLane {
+    const ExecutionContext* execution = nullptr;
+    const ops::PeerEvents* events     = nullptr;
+    std::array<WorkspaceArena*, 2> work{nullptr, nullptr};
+    std::array<std::array<cudaEvent_t, 2>, 2> primary_done{};  // [rank][parity]
+    std::array<std::array<cudaEvent_t, 2>, 2> lane_done{};     // [rank][parity]
+
+    [[nodiscard]] bool complete() const noexcept {
+        return execution != nullptr && events != nullptr && work[0] != nullptr &&
+               work[1] != nullptr && primary_done[0][0] != nullptr && lane_done[0][0] != nullptr;
+    }
+};
+
 struct TpExecution {
     const ExecutionContext* execution = nullptr;
     const ops::PeerEvents* events     = nullptr;
+    const PrefillPipelineLane* pipeline = nullptr;  // null = feature off
     DeviceContext* device             = nullptr;
     const LoadedModelData* weights    = nullptr;
     WorkspaceArena* work              = nullptr;
@@ -363,11 +384,23 @@ private:
     // BF16 partials on both sides and IEEE addition is commutative), which is what keeps every
     // per-device GDN state and KV page in lockstep without any extra synchronization.
     [[nodiscard]] bool tp2() const noexcept { return tp_ != nullptr; }
+    // ACTIVE LANE. Every tp2 layer-body call site takes its ExecutionContext (and therefore its
+    // per-rank streams), PeerEvents and workspace arenas from these four accessors, never from
+    // `tp_` directly. By default they name the primary lane (`tp_->execution`, `tp_->events`,
+    // `work_` / `tp_->work`). The --prefill-pipeline layer loop retargets them to the trailing
+    // half-chunk lane for the duration of one half's layer step (see `LaneScope` in the impl), so
+    // the SAME attn/gdn/mlp code issues onto the second stream pair with its own collective
+    // protocol and scratch, and nothing outside the loop can observe a non-primary lane.
     [[nodiscard]] const ExecutionContext& ec() const;
     [[nodiscard]] std::array<WorkspaceArena*, 2> workspaces() const;
+    [[nodiscard]] const ops::PeerEvents& peer_events() const;
     [[nodiscard]] cudaStream_t stream_for(int rank) const noexcept {
-        return rank == 0 ? ctx_.stream : tp_->device->stream;
+        if (tp_ == nullptr) { return ctx_.stream; }
+        return lane_execution_->dev[static_cast<std::size_t>(rank)]->stream;
     }
+    void run_layers_tp2_pipelined(std::array<Tensor, 2>& x, const std::array<Tensor, 2>& staging,
+                                  const std::array<Tensor, 2>& positions, std::int32_t base,
+                                  DFlashFeatureSink* feature_sink);
     [[nodiscard]] qwen3_6::RoundState& io_for(int rank) const noexcept {
         return rank == 0 ? io_ : *tp_->io;
     }
@@ -552,6 +585,11 @@ private:
     std::array<ops::RopeFrequencyOverride, kTensorParallelWidth> rope_frequency_{};
 
     const TpExecution* tp_                       = nullptr;
+    // Active lane (see the accessor note above). Set to the primary lane in the constructor;
+    // rebound only by the pipelined prefill loop.
+    const ExecutionContext* lane_execution_      = nullptr;
+    const ops::PeerEvents* lane_events_          = nullptr;
+    std::array<WorkspaceArena*, 2> lane_work_{nullptr, nullptr};
     const Tensor* peer_cache_positions_          = nullptr;
     const Tensor* peer_rope_positions_           = nullptr;
     const Tensor* peer_kv_table_rows_            = nullptr;

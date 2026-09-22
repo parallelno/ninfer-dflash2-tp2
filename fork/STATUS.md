@@ -45,6 +45,19 @@ repository root unless stated otherwise.
   `cudaFuncSetAttribute` as `small_t.cu`; replaced with `ensure_func_attr_per_device` so the
   prompt kernels launch on rank 1. Prefill 1.13K -> 1.35K tok/s, TTFT 5.8 -> 4.8-5.0 s at 6.6K
   prompt tokens (reference 1.41K / 4.7 s); outputs unchanged and deterministic.
+- **Prefill: prefix reuse flags, `--prefill-pipeline`, pinned relay** (see
+  `fork/research/prefill/README.md`). The default context-cache settings never produced a prefix
+  hit on this hardware while costing ~0.65 s of capture work per request; with
+  `--max-private-continuations 1 --max-shared-prefixes 0 --max-long-anchors-per-continuation 0`
+  multi-turn agent requests reuse 95 %+ of the prompt (6.5K-token turn 5.3 s → 1.0 s wall).
+  `--prefill-pipeline` (new, tp 2, optional) runs each chunk as two token halves staggered by one
+  layer on two stream lanes so one half's all-reduce overlaps the other's GEMMs; `NINFER_TP2_RELAY=1`
+  (opt-in) moves the eager collectives to pinned bounce buffers so the host thread stops blocking
+  in the driver. Together: marginal prefill 1,444 → 1,774 tok/s (+23 %), 16.8K-token TTFT
+  11.9 → 9.75 s; lane costs ~60 MiB on rank 0 (max context 110K → 106K). Pipeline output is
+  deterministic but not bit-identical to the unpipelined path (GEMM width 512 vs 1024 tile
+  drift, same class as `--prefill-chunk 512`); relay is bit-identical. `fork/start-dflash2-vision2.ps1`
+  enables all three with `-NoPrefillPipeline` / `-NoRelay` / `-DefaultContextCache` escape hatches.
 - **DFlash2 weights on rank 0 only.** The `dflash2/*` objects (~2.07 GiB: 5 draft layers,
   feature projection, candidate-selector codebooks) were `Replicated` on both TP ranks, but the
   draft model only ever runs on rank 0 (`dflash_impl.h`; rank 1 receives drafts by memcpy). That
