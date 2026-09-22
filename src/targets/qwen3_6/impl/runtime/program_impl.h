@@ -9244,7 +9244,7 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                 schedule::PrefillContext schedule_state{
                     {device, model, work, state_images->linear(),
                      replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-                     proposal_head},
+                     proposal_head, rope_frequency, peer_core ? &*peer_core : nullptr},
                     text_kv_view(sequence),
                     mtp_kv_view(sequence),
                     mtp_kv_view_peer(sequence),
@@ -10241,6 +10241,14 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
+        // Rank 1 reads its own io.rope_delta in the tp2 MTP AR step; today the per-chunk write
+        // covers it only because tp2+MTP declines prefix reuse (delta always 0). Mirror it so the
+        // invariant does not depend on that.
+        if (peer) {
+            const schedule::CurrentDevice restore;
+            peer->device.bind_to_current_thread();
+            set_peer_i32(peer->io.rope_delta, sequence.rope_delta);
+        }
 
         request.timings              = {};
         request.pending              = {};
@@ -11093,8 +11101,27 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
             peer->device.bind_to_current_thread();
             set_peer_i32(peer->io.text_kv_table_row, text_row);
             set_peer_i32(peer->io.backend_kv_table_row, backend_row);
+            // ...and take the peer's MTP execution row, which nothing in this tree ever took.
+            // The row's CONTENT on rank 1 is already correct: the execution tables are mirrored
+            // (attach_mirror) and KVExecutionTablePool::publish_indices replays every
+            // publication onto the same index. What was missing is a LEASE from the peer's own
+            // pool, because PagedKVCache::execution_view refuses a lease issued by another pool
+            // -- which is why mtp_kv_view_peer threw "sequence has no peer MTP KV allocation"
+            // on every prefill at --tp 2 --spec mtp, warm-up included (the fork's known issue 2).
+            // bind_sequence_kv is re-entrant on an already-bound sequence: only take the row when
+            // it is missing or names another row, or acquire() reports "already bound".
+            if (sequence.backend_kv_peer_row &&
+                sequence.backend_kv_peer_row->row_index() != backend_row) {
+                sequence.backend_kv_peer_row.reset();
+            }
+            if (sequence.kv->backend && peer->decoder->mtp_cache() != nullptr &&
+                !sequence.backend_kv_peer_row) {
+                sequence.backend_kv_peer_row =
+                    peer->decoder->mtp_cache()->execution_tables().acquire(backend_row);
+            }
         }
     } catch (...) {
+        sequence.backend_kv_peer_row.reset();
         if (!text_active) {
             if (sequence.kv->backend && backend_kv_addresses->active(*sequence.kv->backend)) {
                 backend_kv_addresses->deactivate(*sequence.kv->backend);
@@ -11109,6 +11136,10 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
 
 void ProgramImplCore::unbind_sequence_kv(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
+    // Paired with the acquire in bind_sequence_kv: the lease destructor releases the peer row
+    // (and bumps its generation), so a later bind of another sequence on the same lane gets a
+    // fresh row instead of "already bound".
+    sequence.backend_kv_peer_row.reset();
     try {
         if (sequence.kv->backend && backend_kv_addresses->active(*sequence.kv->backend)) {
             backend_kv_addresses->deactivate(*sequence.kv->backend);
