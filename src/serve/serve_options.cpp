@@ -444,6 +444,23 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         // by the runtime with a descriptive error.
         if (!host_state_explicit) { options.context_cache.host_state_slots = 0; }
         if (!host_kv_explicit) { options.context_cache.host_kv_capacity_bytes = 0; }
+        // With the host tiers off, every checkpoint lives in a device StateImage slot. The engine
+        // default (device_state_slots = max_concurrency, private continuations = 2x) leaves a
+        // single-lane server with exactly one slot -- the live lane -- so no prefix is ever
+        // reusable, and a 2-entry private catalog is evicted by the anchors of one long prompt
+        // (measured 22/09: 100 % re-prefill at concurrency 1, 1 % once the slots exist). Give
+        // tp2 a floor unless the operator set the capacities explicitly.
+        if (!options.context_cache.device_state_slots) {
+            // Measured 22/09: with 2 slots a 12k-token prefix is reused (6 %) but a 35k one is
+            // not (95 %): a long prompt captures more than one image (endpoint + anchors) and
+            // evicts its own endpoint. Four slots (73 MiB per rank each) cover 48k and 100k.
+            options.context_cache.device_state_slots =
+                std::max(options.max_concurrency, static_cast<std::uint32_t>(4));
+        }
+        if (!options.context_cache.max_private_continuations) {
+            options.context_cache.max_private_continuations =
+                std::max(2U * options.max_concurrency, static_cast<std::uint32_t>(8));
+        }
     }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
