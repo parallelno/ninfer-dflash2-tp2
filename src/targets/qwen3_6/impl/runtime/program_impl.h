@@ -11135,6 +11135,7 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
 }
 
 void ProgramImplCore::unbind_sequence_kv(SequenceState& sequence) noexcept {
+    sequence.backend_kv_peer_row.reset();
     if (!sequence.kv) { return; }
     // Paired with the acquire in bind_sequence_kv: the lease destructor releases the peer row
     // (and bumps its generation), so a later bind of another sequence on the same lane gets a
@@ -11216,6 +11217,7 @@ void ProgramImplCore::release_active_sequence_kv_strict(SequenceState& sequence)
         std::terminate();
     }
     if (!text_kv_addresses->release_after_deactivate(sequence.kv->text)) { std::terminate(); }
+    sequence.backend_kv_peer_row.reset();   // peer MTP row lease (see bind_sequence_kv)
     sequence.kv.reset();
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
 }
@@ -11232,6 +11234,7 @@ void ProgramImplCore::release_sequence_kv_strict(SequenceState& sequence) noexce
         std::terminate();
     }
     if (!text_kv_addresses->release(sequence.kv->text)) { std::terminate(); }
+    sequence.backend_kv_peer_row.reset();   // peer MTP row lease (see bind_sequence_kv)
     sequence.kv.reset();
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
 }
