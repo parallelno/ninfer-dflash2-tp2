@@ -11075,10 +11075,25 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
                     backend_kv_addresses->mapped_pages(*sequence.kv->backend), row);
             }
         }
-        set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(sequence.kv->text));
-        set_device_i32(io.backend_kv_table_row,
-                       sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
-                                            : 0);
+        const std::int32_t text_row = text_kv_addresses->bound_row(sequence.kv->text);
+        const std::int32_t backend_row =
+            sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
+        set_device_i32(io.text_kv_table_row, text_row);
+        set_device_i32(io.backend_kv_table_row, backend_row);
+        // tp2: the prefill path binds rank 1's KV execution row to the peer scalar
+        // (text_context_impl.h:2358) and the MTP prefill reads the backend one
+        // (text_context_impl.h:2795). Both were written once, to 0, at construction
+        // (see the peer setup above), so every lane above 0 prefilled through lane 0's
+        // block table: rank 1's half of the KV heads landed in the wrong sequence's pages
+        // and the lane's own prompt pages stayed stale for the whole generation. Decode
+        // rounds carry a per-row table in their ingress, which is why the fault only
+        // showed with more than one lane in flight. Mirror the row on rank 1 at every bind.
+        if (peer) {
+            const schedule::CurrentDevice restore;
+            peer->device.bind_to_current_thread();
+            set_peer_i32(peer->io.text_kv_table_row, text_row);
+            set_peer_i32(peer->io.backend_kv_table_row, backend_row);
+        }
     } catch (...) {
         if (!text_active) {
             if (sequence.kv->backend && backend_kv_addresses->active(*sequence.kv->backend)) {
